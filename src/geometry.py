@@ -110,20 +110,48 @@ def make_tree_polygon(x: float, y: float, angle_deg: float) -> Polygon:
 transform_tree = make_tree_polygon
 
 
-def has_collision(tree_poly: Polygon, other_polys: List[Polygon]) -> bool:
-    """Check if tree_poly overlaps any other polygon (touching OK)."""
+def has_collision(tree_poly: Polygon, other_polys: List[Polygon], buffer: float = 0.0) -> bool:
+    """Check if tree_poly overlaps any other polygon (touching OK).
+
+    Args:
+        tree_poly: The polygon to check
+        other_polys: List of other polygons
+        buffer: Minimum required separation between polygons (default 0.0)
+    """
     for poly in other_polys:
-        if tree_poly.intersects(poly) and not tree_poly.touches(poly):
-            return True
+        if buffer > 0:
+            # Use distance check for buffer-based collision
+            if tree_poly.distance(poly) < buffer:
+                return True
+        else:
+            if tree_poly.intersects(poly) and not tree_poly.touches(poly):
+                return True
     return False
 
 
-def has_collision_strtree(tree_poly: Polygon, tree_index: STRtree, all_polys: List[Polygon]) -> bool:
-    """Fast collision check using STRtree spatial index."""
-    candidates = tree_index.query(tree_poly)
+def has_collision_strtree(tree_poly: Polygon, tree_index: STRtree, all_polys: List[Polygon], buffer: float = 0.0) -> bool:
+    """Fast collision check using STRtree spatial index.
+
+    Args:
+        tree_poly: The polygon to check
+        tree_index: STRtree spatial index
+        all_polys: List of all polygons
+        buffer: Minimum required separation between polygons (default 0.0)
+    """
+    # Expand query bounds if buffer is used
+    if buffer > 0:
+        query_poly = tree_poly.buffer(buffer)
+    else:
+        query_poly = tree_poly
+
+    candidates = tree_index.query(query_poly)
     for idx in candidates:
-        if tree_poly.intersects(all_polys[idx]) and not tree_poly.touches(all_polys[idx]):
-            return True
+        if buffer > 0:
+            if tree_poly.distance(all_polys[idx]) < buffer:
+                return True
+        else:
+            if tree_poly.intersects(all_polys[idx]) and not tree_poly.touches(all_polys[idx]):
+                return True
     return False
 
 
@@ -176,12 +204,24 @@ def normalize_to_origin(placements: List[Tuple[float, float, float]]) -> List[Tu
     return [(x - bounds[0], y - bounds[1], d) for x, y, d in placements]
 
 
-def check_all_overlaps(placements: List[Tuple[float, float, float]]) -> List[Tuple[int, int]]:
-    """Find all overlapping pairs."""
+def check_all_overlaps(placements: List[Tuple[float, float, float]], buffer: float = 0.0) -> List[Tuple[int, int]]:
+    """Find all overlapping pairs.
+
+    Args:
+        placements: List of (x, y, angle) tuples
+        buffer: Minimum required separation between trees (default 0.0)
+
+    Returns:
+        List of (i, j) pairs where trees i and j overlap or are too close
+    """
     polys = [make_tree_polygon(x, y, d) for x, y, d in placements]
     overlaps = []
     for i in range(len(polys)):
         for j in range(i + 1, len(polys)):
-            if polys[i].intersects(polys[j]) and not polys[i].touches(polys[j]):
-                overlaps.append((i, j))
+            if buffer > 0:
+                if polys[i].distance(polys[j]) < buffer:
+                    overlaps.append((i, j))
+            else:
+                if polys[i].intersects(polys[j]) and not polys[i].touches(polys[j]):
+                    overlaps.append((i, j))
     return overlaps

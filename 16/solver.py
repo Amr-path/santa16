@@ -63,6 +63,9 @@ class ExtremeConfig:
     step_in: float = 0.1  # Finer step
     step_out: float = 0.005  # Very fine backup step (0.005 precision)
 
+    # Collision buffer - minimum separation between trees
+    collision_buffer: float = 0.025  # Required minimum separation for safety
+
     # Rotation angles
     num_rotation_angles: int = 72  # Every 5 degrees
 
@@ -284,32 +287,75 @@ nfp_computer = NFPComputer(precision=1000)
 # COLLISION DETECTION
 # =============================================================================
 
-def has_collision(tree_poly: Polygon, other_polys: List[Polygon]) -> bool:
-    """Check if tree_poly overlaps any other polygon."""
+def has_collision(tree_poly: Polygon, other_polys: List[Polygon], buffer: float = 0.0) -> bool:
+    """Check if tree_poly overlaps any other polygon.
+
+    Args:
+        tree_poly: The polygon to check
+        other_polys: List of other polygons
+        buffer: Minimum required separation between polygons (default 0.0)
+    """
     for poly in other_polys:
-        if tree_poly.intersects(poly) and not tree_poly.touches(poly):
-            return True
+        if buffer > 0:
+            # Use distance check for buffer-based collision
+            if tree_poly.distance(poly) < buffer:
+                return True
+        else:
+            if tree_poly.intersects(poly) and not tree_poly.touches(poly):
+                return True
     return False
 
 
 def has_collision_strtree(
     tree_poly: Polygon,
     tree_index: STRtree,
-    all_polys: List[Polygon]
+    all_polys: List[Polygon],
+    buffer: float = 0.0
 ) -> bool:
-    """Fast collision check using spatial index."""
-    candidates = tree_index.query(tree_poly)
+    """Fast collision check using spatial index.
+
+    Args:
+        tree_poly: The polygon to check
+        tree_index: STRtree spatial index
+        all_polys: List of all polygons
+        buffer: Minimum required separation between polygons (default 0.0)
+    """
+    # Expand query bounds if buffer is used
+    if buffer > 0:
+        query_poly = tree_poly.buffer(buffer)
+    else:
+        query_poly = tree_poly
+
+    candidates = tree_index.query(query_poly)
     for idx in candidates:
-        if tree_poly.intersects(all_polys[idx]) and not tree_poly.touches(all_polys[idx]):
-            return True
+        if buffer > 0:
+            if tree_poly.distance(all_polys[idx]) < buffer:
+                return True
+        else:
+            if tree_poly.intersects(all_polys[idx]) and not tree_poly.touches(all_polys[idx]):
+                return True
     return False
 
 
-def has_collision_prepared(tree_poly: Polygon, prepared_polys: List) -> bool:
-    """Fast collision check using prepared geometries."""
+def has_collision_prepared(tree_poly: Polygon, prepared_polys: List, buffer: float = 0.0) -> bool:
+    """Fast collision check using prepared geometries.
+
+    Args:
+        tree_poly: The polygon to check
+        prepared_polys: List of prepared polygons
+        buffer: Minimum required separation between polygons (default 0.0)
+    """
     for pp in prepared_polys:
-        if pp.intersects(tree_poly) and not pp.touches(tree_poly):
-            return True
+        if buffer > 0:
+            # Get original polygon from prepared for distance check
+            if hasattr(pp, 'context'):
+                if tree_poly.distance(pp.context) < buffer:
+                    return True
+            elif pp.intersects(tree_poly):
+                return True
+        else:
+            if pp.intersects(tree_poly) and not pp.touches(tree_poly):
+                return True
     return False
 
 
@@ -384,15 +430,28 @@ def normalize_to_origin(
 
 
 def check_all_overlaps(
-    placements: List[Tuple[float, float, float]]
+    placements: List[Tuple[float, float, float]],
+    buffer: float = 0.0
 ) -> List[Tuple[int, int]]:
-    """Find all overlapping pairs."""
+    """Find all overlapping pairs.
+
+    Args:
+        placements: List of (x, y, angle) tuples
+        buffer: Minimum required separation between trees (default 0.0)
+
+    Returns:
+        List of (i, j) pairs where trees i and j overlap or are too close
+    """
     polys = [make_tree_polygon(x, y, d) for x, y, d in placements]
     overlaps = []
     for i in range(len(polys)):
         for j in range(i + 1, len(polys)):
-            if polys[i].intersects(polys[j]) and not polys[i].touches(polys[j]):
-                overlaps.append((i, j))
+            if buffer > 0:
+                if polys[i].distance(polys[j]) < buffer:
+                    overlaps.append((i, j))
+            else:
+                if polys[i].intersects(polys[j]) and not polys[i].touches(polys[j]):
+                    overlaps.append((i, j))
     return overlaps
 
 
@@ -456,10 +515,12 @@ def place_tree_greedy_radial(
     config: ExtremeConfig
 ) -> Tuple[float, float]:
     """
-    Place tree using radial greedy approach with fine stepping.
+    Place tree using radial greedy approach with fine stepping and collision buffer.
     """
     if not existing_polys:
         return 0.0, 0.0
+
+    buffer = config.collision_buffer
 
     # Build spatial index
     tree_index = STRtree(existing_polys)
@@ -483,13 +544,13 @@ def place_tree_greedy_radial(
 
             candidate_poly = affinity.translate(base_polygon, xoff=px, yoff=py)
 
-            if has_collision_strtree(candidate_poly, tree_index, existing_polys):
+            if has_collision_strtree(candidate_poly, tree_index, existing_polys, buffer):
                 collision_found = True
                 break
 
             radius -= config.step_in
 
-        # Fine backup until no collision
+        # Fine backup until no collision (with buffer)
         if collision_found:
             while radius < config.start_radius * 2:
                 radius += config.step_out  # 0.005 precision
@@ -498,7 +559,7 @@ def place_tree_greedy_radial(
 
                 candidate_poly = affinity.translate(base_polygon, xoff=px, yoff=py)
 
-                if not has_collision_strtree(candidate_poly, tree_index, existing_polys):
+                if not has_collision_strtree(candidate_poly, tree_index, existing_polys, buffer):
                     break
         else:
             radius = 0
@@ -523,7 +584,7 @@ def simulated_annealing_advanced(
     current_best_score: float = float('inf')
 ) -> Tuple[List[Tuple[float, float, float]], float]:
     """
-    Advanced Simulated Annealing with 5 move types:
+    Advanced Simulated Annealing with 5 move types and collision buffer:
     1. Small moves (random walk) - 30%
     2. Large moves (escape local minima) - 15%
     3. Rotation changes - 25%
@@ -534,6 +595,7 @@ def simulated_annealing_advanced(
     if n <= 1:
         return placements, compute_bounding_square_side(placements)
 
+    buffer = config.collision_buffer
     start_time = time.time()
 
     current = list(placements)
@@ -610,15 +672,15 @@ def simulated_annealing_advanced(
             new_polys[i] = make_tree_polygon(x2, y2, d1)
             new_polys[j] = make_tree_polygon(x1, y1, d2)
 
-            # Check collisions
+            # Check collisions with buffer
             valid = True
             for k in range(n):
                 if k != i and k != j:
-                    if has_collision(new_polys[i], [new_polys[k]]) or \
-                       has_collision(new_polys[j], [new_polys[k]]):
+                    if has_collision(new_polys[i], [new_polys[k]], buffer) or \
+                       has_collision(new_polys[j], [new_polys[k]], buffer):
                         valid = False
                         break
-            if has_collision(new_polys[i], [new_polys[j]]):
+            if has_collision(new_polys[i], [new_polys[j]], buffer):
                 valid = False
 
             if valid:
@@ -664,11 +726,11 @@ def simulated_annealing_advanced(
             move_type = "center"
 
         if move_type != "swap":
-            # Create new polygon and check collision
+            # Create new polygon and check collision with buffer
             new_poly = make_tree_polygon(new_x, new_y, new_deg)
             others = polys[:i] + polys[i+1:]
 
-            if has_collision(new_poly, others):
+            if has_collision(new_poly, others, buffer):
                 # Update temperature
                 progress = (time.time() - start_time) / time_limit
                 T = config.sa_temp_initial * math.pow(config.sa_temp_final / config.sa_temp_initial, progress)
@@ -716,10 +778,11 @@ def simulated_annealing_advanced(
 def local_search_fine(
     placements: List[Tuple[float, float, float]],
     precision: float = 0.005,
-    max_iterations: int = 500
+    max_iterations: int = 500,
+    buffer: float = 0.025
 ) -> List[Tuple[float, float, float]]:
     """
-    Fine-grained local search with 0.005 precision.
+    Fine-grained local search with 0.005 precision and collision buffer.
     """
     n = len(placements)
     if n <= 1:
@@ -748,7 +811,7 @@ def local_search_fine(
                 new_poly = make_tree_polygon(new_x, new_y, deg)
 
                 others = polys[:i] + polys[i+1:]
-                if not has_collision(new_poly, others):
+                if not has_collision(new_poly, others, buffer):
                     old_poly = polys[i]
                     polys[i] = new_poly
                     new_score = bounding_square_side_from_polys(polys)
@@ -766,7 +829,7 @@ def local_search_fine(
                 new_poly = make_tree_polygon(x, y, new_deg)
 
                 others = polys[:i] + polys[i+1:]
-                if not has_collision(new_poly, others):
+                if not has_collision(new_poly, others, buffer):
                     old_poly = polys[i]
                     polys[i] = new_poly
                     new_score = bounding_square_side_from_polys(polys)
@@ -877,28 +940,30 @@ class ExtremeSolver:
                     solution, self.config, remaining_time, best_score
                 )
 
-                # Local search refinement
+                # Local search refinement with collision buffer
                 if remaining_time > 1.0:
                     optimized = local_search_fine(
                         optimized,
                         self.config.local_search_precision,
-                        self.config.local_search_iterations // 2
+                        self.config.local_search_iterations // 2,
+                        self.config.collision_buffer
                     )
                     score = compute_bounding_square_side(optimized)
 
                 if score < best_score:
-                    # Validate
-                    overlaps = check_all_overlaps(optimized)
+                    # Validate with collision buffer
+                    overlaps = check_all_overlaps(optimized, self.config.collision_buffer)
                     if not overlaps:
                         best_score = score
                         best_solution = optimized
 
-        # Final local search
+        # Final local search with collision buffer
         if best_solution is not None and time.time() - start_time < time_budget * 0.98:
             best_solution = local_search_fine(
                 best_solution,
                 self.config.local_search_precision,
-                self.config.local_search_iterations
+                self.config.local_search_iterations,
+                self.config.collision_buffer
             )
             best_score = compute_bounding_square_side(best_solution)
 
