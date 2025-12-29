@@ -1,0 +1,65 @@
+# Santa 2025 Extreme Optimization Solver - Requirements
+# =====================================================
+#
+# Installation on VPS:
+# --------------------
+# 1. Make sure you have Python 3.8+ installed:
+#    python3 --version
+#
+# 2. Create a virtual environment (recommended):
+#    python3 -m venv santa_env
+#    source santa_env/bin/activate
+#
+# 3. Upgrade pip:
+#    pip install --upgrade pip
+#
+# 4. Install requirements:
+#    pip install -r requirements.txt
+#
+# 5. Run the solver:
+#    python solver.py
+#
+#    Options:
+#    --output submission.csv    Output file path
+#    --seed 42                  Random seed for reproducibility
+#    --max-n 200                Maximum puzzle size
+#    --time-per-puzzle 60       Seconds per puzzle (default 60)
+#    --restarts 25              Number of restarts per puzzle
+#    --quick                    Quick mode (~50 min instead of ~200 min)
+#
+# Example runs:
+# -------------
+# Full optimization (target score < 55):
+#    python solver.py --time-per-puzzle 60 --restarts 25
+#
+# Quick test run:
+#    python solver.py --quick
+#
+# Custom configuration:
+#    python solver.py --time-per-puzzle 90 --restarts 30 --seed 123
+#
+# Running in background (recommended for VPS):
+#    nohup python solver.py > solver.log 2>&1 &
+#    tail -f solver.log
+#
+# Using screen (alternative for VPS):
+#    screen -S santa
+#    python solver.py
+#    # Press Ctrl+A, then D to detach
+#    # screen -r santa to reattach
+
+# Core dependencies
+numpy>=1.21.0
+shapely>=2.0.0
+
+# NFP (No-Fit Polygon) support - CRITICAL for best results
+pyclipper>=1.3.0
+
+# Optional but recommended
+# For multiprocessing (included in Python stdlib)
+# For progress bars (optional):
+# tqdm>=4.60.0
+
+# Development/debugging (optional):
+# matplotlib>=3.5.0
+# pandas>=1.3.0

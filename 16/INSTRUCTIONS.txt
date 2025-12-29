@@ -1,0 +1,259 @@
+================================================================================
+SANTA 2025 EXTREME OPTIMIZATION SOLVER - VPS INSTRUCTIONS
+================================================================================
+
+This solver is optimized to achieve a score below 55 (from baseline 157.08).
+
+FEATURES:
+---------
+- No-Fit Polygon (NFP) using pyclipper for precise valid position finding
+- 25+ multi-restart strategy per puzzle
+- Advanced Simulated Annealing with 5 move types:
+  * Small moves (random walk) - 30%
+  * Large moves (escape local minima) - 15%
+  * Rotation changes - 25%
+  * Position swaps between trees - 15%
+  * Center-seeking moves - 15%
+- 72 rotation angles (every 5 degrees)
+- 60 seconds per puzzle (~200 minutes total)
+- Fine-grained 0.005 precision local search
+- Adaptive step sizes based on acceptance rate
+
+================================================================================
+QUICK START
+================================================================================
+
+# 1. SSH into your VPS
+ssh user@your-vps-ip
+
+# 2. Update system packages (Ubuntu/Debian)
+sudo apt update && sudo apt upgrade -y
+
+# 3. Install Python 3.8+ and pip
+sudo apt install python3 python3-pip python3-venv -y
+
+# 4. Clone or upload the solver
+# If using git:
+git clone <your-repo-url>
+cd santa16/16
+
+# Or upload via scp:
+scp -r 16/ user@your-vps-ip:~/santa16/
+
+# 5. Create virtual environment
+python3 -m venv santa_env
+source santa_env/bin/activate
+
+# 6. Upgrade pip
+pip install --upgrade pip
+
+# 7. Install dependencies
+pip install -r requirements.txt
+
+# 8. Run the solver (in background recommended)
+nohup python solver.py > solver.log 2>&1 &
+
+# 9. Monitor progress
+tail -f solver.log
+
+================================================================================
+DETAILED SETUP
+================================================================================
+
+SYSTEM REQUIREMENTS:
+-------------------
+- Python 3.8 or higher
+- At least 4GB RAM (8GB recommended)
+- At least 2 CPU cores (4+ recommended for faster processing)
+- ~500MB disk space
+
+INSTALLING DEPENDENCIES:
+-----------------------
+The critical dependencies are:
+
+1. numpy - Numerical operations
+   pip install numpy>=1.21.0
+
+2. shapely - Polygon geometry operations
+   pip install shapely>=2.0.0
+
+   Note: On some systems you may need:
+   sudo apt install libgeos-dev
+
+3. pyclipper - NO-FIT POLYGON (CRITICAL for best results!)
+   pip install pyclipper>=1.3.0
+
+   Note: This requires a C++ compiler. Install if needed:
+   sudo apt install build-essential
+
+================================================================================
+RUNNING THE SOLVER
+================================================================================
+
+BASIC RUN (Full optimization, ~200 minutes):
+-------------------------------------------
+python solver.py
+
+OUTPUT:
+- submission.csv (Kaggle submission file)
+- Console output showing progress
+
+QUICK TEST RUN (~50 minutes):
+----------------------------
+python solver.py --quick
+
+CUSTOM CONFIGURATION:
+--------------------
+# Maximum optimization (longer time):
+python solver.py --time-per-puzzle 90 --restarts 35
+
+# Different seed for reproducibility:
+python solver.py --seed 12345
+
+# Output to different file:
+python solver.py --output my_submission.csv
+
+RUNNING IN BACKGROUND (RECOMMENDED FOR VPS):
+-------------------------------------------
+
+Option 1: Using nohup
+--------------------
+nohup python solver.py > solver.log 2>&1 &
+echo $! > solver.pid
+
+# Monitor progress:
+tail -f solver.log
+
+# Check if still running:
+ps -p $(cat solver.pid)
+
+# Kill if needed:
+kill $(cat solver.pid)
+
+Option 2: Using screen
+---------------------
+# Start screen session:
+screen -S santa
+
+# Run solver:
+python solver.py
+
+# Detach: Press Ctrl+A, then D
+
+# Reattach later:
+screen -r santa
+
+Option 3: Using tmux
+-------------------
+# Start tmux session:
+tmux new -s santa
+
+# Run solver:
+python solver.py
+
+# Detach: Press Ctrl+B, then D
+
+# Reattach later:
+tmux attach -t santa
+
+================================================================================
+EXPECTED RESULTS
+================================================================================
+
+Target Score: < 55.0 (from baseline 157.08)
+
+Typical results:
+- Quick mode (~50 min):   Score ~70-80
+- Standard (60s/puzzle):  Score ~50-60
+- Extended (90s/puzzle):  Score ~45-55
+
+Score is calculated as: sum((bounding_square_side^2) / n) for n=1 to 200
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+ERROR: ModuleNotFoundError: No module named 'shapely'
+----------------------------------------------------
+pip install shapely
+# Or if that fails:
+pip install shapely --no-binary shapely
+
+ERROR: ModuleNotFoundError: No module named 'pyclipper'
+------------------------------------------------------
+# Install C++ build tools first:
+sudo apt install build-essential
+pip install pyclipper
+
+The solver will still work without pyclipper but NFP will be disabled,
+resulting in slightly worse scores.
+
+ERROR: GEOS library not found
+-----------------------------
+sudo apt install libgeos-dev
+pip install shapely --force-reinstall --no-binary shapely
+
+MEMORY ERROR:
+-------------
+If you run out of memory, try reducing restarts:
+python solver.py --restarts 15 --time-per-puzzle 45
+
+SLOW PERFORMANCE:
+----------------
+Check CPU usage:
+top
+
+If solver is running but slow:
+- Reduce --restarts (e.g., --restarts 15)
+- Reduce --time-per-puzzle (e.g., --time-per-puzzle 30)
+
+================================================================================
+OUTPUT FORMAT
+================================================================================
+
+The submission.csv file follows the Kaggle format:
+- Header: id,x,y,deg
+- id: NNN_I (3-digit n, underscore, tree index)
+- x,y,deg: prefixed with 's' and 6 decimal places
+
+Example:
+id,x,y,deg
+001_0,s0.350000,s0.500000,s45.123456
+002_0,s0.350000,s0.500000,s45.123456
+002_1,s0.850000,s0.500000,s135.654321
+...
+
+Total rows: 1 header + 20100 data rows
+
+================================================================================
+VERIFICATION
+================================================================================
+
+To verify your submission locally:
+
+python -c "
+import solver
+solutions = solver.main()
+score = solver.compute_score(solutions)
+print(f'Final Score: {score:.4f}')
+"
+
+To just validate a saved solution:
+
+python -c "
+from solver import validate_all_solutions, compute_score
+# Load and validate your solutions here
+"
+
+================================================================================
+CONTACT / ISSUES
+================================================================================
+
+If you encounter issues:
+1. Check the log file for error messages
+2. Ensure all dependencies are correctly installed
+3. Verify Python version (python3 --version)
+4. Check available memory (free -h)
+
+Good luck achieving score < 55!
+================================================================================
