@@ -82,8 +82,8 @@ class UltraConfig:
     time_base: float = 30.0  # Base time
     time_scale: float = 0.5  # Additional time per n
 
-    # Parallel workers
-    num_workers: int = 4
+    # Parallel workers - set to number of cores to use
+    num_workers: int = 15
 
     seed: int = 42
 
@@ -756,6 +756,133 @@ def compact_solution(placements: List[Tuple[float, float, float]],
 
 
 # =============================================================================
+# PARALLEL WORKER FUNCTION
+# =============================================================================
+
+def _run_restart_batch(args: Tuple) -> Tuple[Optional[List[Tuple[float, float, float]]], float]:
+    """
+    Worker function for parallel restart execution.
+    Must be a top-level function for pickling.
+
+    Args:
+        args: Tuple of (restart_ids, prev_solution, config_dict, base_seed, n, best_solution_hint, best_score_hint)
+
+    Returns:
+        Tuple of (best_solution, best_score) from this batch
+    """
+    restart_ids, prev_solution, config_dict, base_seed, n, best_solution_hint, best_score_hint = args
+
+    # Reconstruct config from dict
+    config = UltraConfig(**config_dict)
+
+    # Build previous polygons
+    prev_polys = [make_tree_polygon(x, y, d) for x, y, d in prev_solution]
+    rotation_angles = [i * 5.0 for i in range(72)]
+
+    best_solution = None
+    best_score = float('inf')
+
+    for restart in restart_ids:
+        # Vary seed
+        random.seed(base_seed + restart * 1000 + n)
+        np.random.seed(base_seed + restart * 1000 + n)
+
+        # Try different rotation angle for new tree
+        angle_idx = restart % len(rotation_angles)
+        new_angle = rotation_angles[angle_idx]
+        new_base = ROTATED_POLYGONS[int(new_angle) % 360]
+
+        # Try different placement strategies
+        strategy = restart % 3
+        if strategy == 0:
+            best_x, best_y = place_tree_radial(new_base, prev_polys, config)
+        elif strategy == 1:
+            best_x, best_y = place_tree_spiral(new_base, prev_polys, config)
+        else:
+            best_x, best_y = place_tree_grid_search(new_base, prev_polys, config)
+
+        # Build initial solution
+        solution = prev_solution + [(best_x, best_y, new_angle)]
+
+        # Perturb for restarts > 0 if we have a hint
+        if restart > 0 and best_solution_hint is not None and restart % 5 != 0:
+            solution = list(best_solution_hint)
+            num_to_perturb = max(1, int(n * 0.15))
+            indices = random.sample(range(n), num_to_perturb)
+
+            for idx in indices:
+                x, y, d = solution[idx]
+                solution[idx] = (
+                    x + random.gauss(0, 0.03 * best_score_hint),
+                    y + random.gauss(0, 0.03 * best_score_hint),
+                    (d + random.uniform(-10, 10)) % 360
+                )
+
+        # Validate initial solution
+        overlaps = check_overlaps(solution, config.collision_buffer)
+        if overlaps:
+            repaired = repair_overlaps(solution, config.collision_buffer)
+            if repaired:
+                solution = repaired
+            else:
+                continue
+
+        # Multi-phase simulated annealing (with reduced time per restart in parallel mode)
+        time_per_restart = 2.0  # Fixed time budget per restart in parallel mode
+        solution = multi_phase_sa(solution, config, time_per_restart)
+
+        # Local search
+        solution = local_search(solution, config)
+
+        # Compacting
+        solution = compact_solution(solution, config)
+
+        # Final local search
+        solution = local_search(solution, config)
+
+        # Evaluate
+        score = compute_bounding_square(solution)
+
+        # Validate
+        overlaps = check_overlaps(solution, config.collision_buffer)
+        if not overlaps and score < best_score:
+            best_score = score
+            best_solution = solution
+
+    return best_solution, best_score
+
+
+def _config_to_dict(config: UltraConfig) -> Dict:
+    """Convert UltraConfig to a picklable dict."""
+    return {
+        'num_restarts': config.num_restarts,
+        'population_size': config.population_size,
+        'ga_generations': config.ga_generations,
+        'ga_elite_count': config.ga_elite_count,
+        'ga_mutation_rate': config.ga_mutation_rate,
+        'ga_crossover_rate': config.ga_crossover_rate,
+        'num_placement_attempts': config.num_placement_attempts,
+        'start_radius': config.start_radius,
+        'step_in': config.step_in,
+        'step_out': config.step_out,
+        'collision_buffer': config.collision_buffer,
+        'num_rotation_angles': config.num_rotation_angles,
+        'sa_phases': config.sa_phases,
+        'sa_iterations_per_phase': config.sa_iterations_per_phase,
+        'sa_temp_initial': config.sa_temp_initial,
+        'sa_temp_final': config.sa_temp_final,
+        'local_search_precision': config.local_search_precision,
+        'local_search_iterations': config.local_search_iterations,
+        'compacting_passes': config.compacting_passes,
+        'compacting_step': config.compacting_step,
+        'time_base': config.time_base,
+        'time_scale': config.time_scale,
+        'num_workers': config.num_workers,
+        'seed': config.seed,
+    }
+
+
+# =============================================================================
 # MAIN SOLVER
 # =============================================================================
 
@@ -773,7 +900,7 @@ class UltraSolver:
 
     def solve_single(self, n: int, prev_solution: List[Tuple[float, float, float]],
                      verbose: bool = False) -> Tuple[List[Tuple[float, float, float]], float]:
-        """Solve for n trees with ultra optimization."""
+        """Solve for n trees with ultra optimization using parallel restarts."""
         if n <= 0:
             return [], 0.0
 
@@ -781,89 +908,50 @@ class UltraSolver:
             sol = [(0.0, 0.0, 0.0)]
             return sol, compute_bounding_square(sol)
 
-        # Time budget
-        time_budget = self.config.time_base + self.config.time_scale * n
         start_time = time.time()
-
         prev_polys = [make_tree_polygon(x, y, d) for x, y, d in prev_solution]
 
         best_solution = None
         best_score = float('inf')
 
-        # Get all rotation angles
-        rotation_angles = [i * 5.0 for i in range(72)]
+        num_workers = self.config.num_workers
+        num_restarts = self.config.num_restarts
 
-        for restart in range(self.config.num_restarts):
-            if time.time() - start_time >= time_budget * 0.95:
-                break
+        # Distribute restarts across workers
+        restarts_per_worker = max(1, num_restarts // num_workers)
+        restart_batches = []
+        for i in range(num_workers):
+            start_idx = i * restarts_per_worker
+            end_idx = start_idx + restarts_per_worker if i < num_workers - 1 else num_restarts
+            if start_idx < num_restarts:
+                restart_batches.append(list(range(start_idx, end_idx)))
 
-            # Vary seed
-            random.seed(self.seed + restart * 1000 + n)
+        # Convert config to dict for pickling
+        config_dict = _config_to_dict(self.config)
 
-            # Try different rotation angle for new tree
-            angle_idx = restart % len(rotation_angles)
-            new_angle = rotation_angles[angle_idx]
-            new_base = ROTATED_POLYGONS[int(new_angle) % 360]
+        # Prepare arguments for each worker
+        worker_args = [
+            (batch, prev_solution, config_dict, self.seed, n, None, float('inf'))
+            for batch in restart_batches
+        ]
 
-            # Try different placement strategies
-            strategy = restart % 3
-            if strategy == 0:
-                best_x, best_y = place_tree_radial(new_base, prev_polys, self.config)
-            elif strategy == 1:
-                best_x, best_y = place_tree_spiral(new_base, prev_polys, self.config)
-            else:
-                best_x, best_y = place_tree_grid_search(new_base, prev_polys, self.config)
+        # Run restarts in parallel
+        results = []
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(_run_restart_batch, args) for args in worker_args]
 
-            # Build initial solution
-            solution = prev_solution + [(best_x, best_y, new_angle)]
+            for future in as_completed(futures):
+                try:
+                    solution, score = future.result()
+                    if solution is not None:
+                        results.append((solution, score))
+                except Exception as e:
+                    if verbose:
+                        print(f"    Worker error: {e}")
 
-            # Perturb for restarts > 0
-            if restart > 0 and best_solution is not None and restart % 5 != 0:
-                # Start from best and perturb
-                solution = list(best_solution)
-                num_to_perturb = max(1, int(n * 0.15))
-                indices = random.sample(range(n), num_to_perturb)
-
-                for idx in indices:
-                    x, y, d = solution[idx]
-                    solution[idx] = (
-                        x + random.gauss(0, 0.03 * best_score),
-                        y + random.gauss(0, 0.03 * best_score),
-                        (d + random.uniform(-10, 10)) % 360
-                    )
-
-            # Validate initial solution
-            overlaps = check_overlaps(solution, self.config.collision_buffer)
-            if overlaps:
-                repaired = repair_overlaps(solution, self.config.collision_buffer)
-                if repaired:
-                    solution = repaired
-                else:
-                    continue
-
-            # Calculate remaining time for this restart
-            elapsed = time.time() - start_time
-            remaining = (time_budget - elapsed) / max(1, self.config.num_restarts - restart)
-
-            # Multi-phase simulated annealing
-            if remaining > 0.5:
-                solution = multi_phase_sa(solution, self.config, remaining * 0.6)
-
-            # Local search
-            solution = local_search(solution, self.config)
-
-            # Compacting
-            solution = compact_solution(solution, self.config)
-
-            # Final local search
-            solution = local_search(solution, self.config)
-
-            # Evaluate
-            score = compute_bounding_square(solution)
-
-            # Validate
-            overlaps = check_overlaps(solution, self.config.collision_buffer)
-            if not overlaps and score < best_score:
+        # Find best result from all workers
+        for solution, score in results:
+            if score < best_score:
                 best_score = score
                 best_solution = solution
 
@@ -889,8 +977,9 @@ class UltraSolver:
 
         if verbose:
             print("=" * 70)
-            print("SANTA 2025 - ULTRA OPTIMIZATION SOLVER")
+            print("SANTA 2025 - ULTRA OPTIMIZATION SOLVER (PARALLEL)")
             print("=" * 70)
+            print(f"Parallel workers: {self.config.num_workers}")
             print(f"Restarts per puzzle: {self.config.num_restarts}")
             print(f"Population size: {self.config.population_size}")
             print(f"SA phases: {self.config.sa_phases}")
@@ -1049,17 +1138,19 @@ def print_score_summary(solutions: Dict[int, List[Tuple[float, float, float]]], 
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Santa 2025 Ultra Optimization Solver")
+    parser = argparse.ArgumentParser(description="Santa 2025 Ultra Optimization Solver (Parallel)")
     parser.add_argument("--output", type=str, default="submission.csv", help="Output CSV path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--max-n", type=int, default=200, help="Maximum n to solve")
     parser.add_argument("--restarts", type=int, default=100, help="Restarts per puzzle")
+    parser.add_argument("--workers", type=int, default=15, help="Number of parallel workers (CPU cores)")
     parser.add_argument("--quick", action="store_true", help="Quick mode")
     args = parser.parse_args()
 
     config = UltraConfig()
     config.seed = args.seed
     config.num_restarts = args.restarts
+    config.num_workers = args.workers
 
     if args.quick:
         config.num_restarts = 20
@@ -1069,6 +1160,7 @@ def main():
         config.time_scale = 0.2
 
     print("Configuration:")
+    print(f"  Parallel workers: {config.num_workers}")
     print(f"  Restarts: {config.num_restarts}")
     print(f"  Placement attempts: {config.num_placement_attempts}")
     print(f"  SA phases: {config.sa_phases}")
