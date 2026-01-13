@@ -231,8 +231,8 @@ class Config:
     collision_buffer: float = 0.001
 
     # Small n special handling
-    small_n_threshold: int = 10
-    small_n_time_multiplier: float = 2.0
+    small_n_threshold: int = 20
+    small_n_time_multiplier: float = 3.0
 
     checkpoint_interval: int = 5
     checkpoint_path: str = "elite_v3_checkpoint.csv"
@@ -254,15 +254,14 @@ class Config:
 def quick_config() -> Config:
     return Config(
         max_hours=2.0,
-        time_per_puzzle_base=8.0,
-        priority_multiplier=5.0,
-        cma_population=15,
-        cma_max_iter=100,
-        num_restarts=10,
-        local_iterations=500,
-        compact_passes=20,
-        small_n_threshold=8,
-        small_n_time_multiplier=1.5,
+        time_per_puzzle_base=12.0,
+        priority_multiplier=8.0,
+        cma_population=25,
+        cma_max_iter=150,
+        num_restarts=15,
+        local_iterations=800,
+        compact_passes=30,
+        small_n_time_multiplier=2.0,
     )
 
 
@@ -288,43 +287,31 @@ def ultra_config() -> Config:
 # PACKING PATTERNS
 # =============================================================================
 
-def get_safe_spacing(angle: float) -> Tuple[float, float]:
-    """Get safe spacing for trees at given angle to avoid overlaps."""
-    w, h = tree_bbox_at_angle(int(angle) % 360)
-    # Add buffer to ensure no overlaps
-    return (w + 0.02, h + 0.02)
-
-
 def pattern_grid(n: int, angle: float = None) -> List[Tuple[float, float, float]]:
-    """Offset grid pattern with safe spacing."""
+    """Offset grid pattern."""
     if angle is None:
         angle = OPTIMAL_ANGLE
 
-    # Get safe spacing based on tree bounding box
-    spacing_x, spacing_y = get_safe_spacing(angle)
-
+    spacing = 0.78  # Tight spacing
     placements = []
     cols = int(math.ceil(math.sqrt(n * 1.1)))
 
     for i in range(n):
         row = i // cols
         col = i % cols
-        x = col * spacing_x + (row % 2) * (spacing_x / 2)
-        y = row * spacing_y
+        x = col * spacing + (row % 2) * (spacing / 2)
+        y = row * spacing * 0.85
         placements.append((x, y, float(angle)))
 
     return center(placements)
 
 
 def pattern_hex(n: int, angle: float = None) -> List[Tuple[float, float, float]]:
-    """Hexagonal grid pattern with safe spacing."""
+    """Hexagonal grid pattern."""
     if angle is None:
         angle = OPTIMAL_ANGLE
 
-    # Use larger of width/height for hex spacing
-    w, h = tree_bbox_at_angle(int(angle) % 360)
-    spacing = max(w, h) + 0.02
-
+    spacing = 0.76
     dx = spacing
     dy = spacing * math.sqrt(3) / 2
     placements = []
@@ -341,37 +328,29 @@ def pattern_hex(n: int, angle: float = None) -> List[Tuple[float, float, float]]
 
 
 def pattern_spiral(n: int, angle: float = None) -> List[Tuple[float, float, float]]:
-    """Golden angle spiral pattern with safe spacing."""
+    """Golden angle spiral pattern."""
     if angle is None:
         angle = OPTIMAL_ANGLE
-
-    # Get safe radius increment
-    w, h = tree_bbox_at_angle(int(angle) % 360)
-    min_spacing = max(w, h) + 0.02
 
     golden_angle = 2.39996323
     placements = []
     radius = 0.0
-    radius_inc = min_spacing * 0.35
+    radius_inc = 0.22
 
     for i in range(n):
         theta = i * golden_angle
         x = radius * math.cos(theta)
         y = radius * math.sin(theta)
         placements.append((x, y, float(angle)))
-        radius += radius_inc / (1 + i * 0.005)
+        radius += radius_inc / (1 + i * 0.008)
 
     return center(placements)
 
 
 def pattern_concentric(n: int, angle: float = None) -> List[Tuple[float, float, float]]:
-    """Concentric rings pattern with safe spacing."""
+    """Concentric rings pattern."""
     if angle is None:
         angle = OPTIMAL_ANGLE
-
-    w, h = tree_bbox_at_angle(int(angle) % 360)
-    ring_spacing = max(w, h) + 0.02
-    arc_spacing = max(w, h) + 0.02
 
     placements = []
     if n == 0:
@@ -380,11 +359,11 @@ def pattern_concentric(n: int, angle: float = None) -> List[Tuple[float, float, 
     placements.append((0.0, 0.0, float(angle)))
     remaining = n - 1
     ring = 1
+    ring_spacing = 0.80
 
     while remaining > 0:
         radius = ring * ring_spacing
-        circumference = 2 * math.pi * radius
-        trees_in_ring = min(remaining, max(6, int(circumference / arc_spacing)))
+        trees_in_ring = min(remaining, max(6, int(2 * math.pi * radius / 0.68)))
 
         for i in range(trees_in_ring):
             theta = 2 * math.pi * i / trees_in_ring
@@ -399,15 +378,10 @@ def pattern_concentric(n: int, angle: float = None) -> List[Tuple[float, float, 
 
 
 def pattern_interlocked(n: int) -> List[Tuple[float, float, float]]:
-    """Interlocked pairs pattern - trees facing each other with safe spacing."""
+    """Interlocked pairs pattern - trees facing each other."""
     placements = []
-
-    # At 45 and 225 degrees
-    w1, h1 = tree_bbox_at_angle(45)
-    w2, h2 = tree_bbox_at_angle(225)
-
-    spacing_x = max(w1, w2) + 0.03
-    spacing_y = max(h1, h2) + 0.03
+    spacing_x = 0.85
+    spacing_y = 0.85
 
     pairs_per_row = int(math.ceil(math.sqrt(n / 2)))
     idx = 0
@@ -420,13 +394,15 @@ def pattern_interlocked(n: int) -> List[Tuple[float, float, float]]:
             base_x = col * spacing_x * 2
             base_y = row * spacing_y * 2
 
+            # First tree pointing up-right
             placements.append((base_x, base_y, 45.0))
             idx += 1
 
             if idx >= n:
                 break
 
-            placements.append((base_x + spacing_x, base_y + spacing_y * 0.6, 225.0))
+            # Second tree pointing down-left, offset
+            placements.append((base_x + spacing_x, base_y + spacing_y * 0.5, 225.0))
             idx += 1
 
         if idx >= n:
@@ -436,13 +412,11 @@ def pattern_interlocked(n: int) -> List[Tuple[float, float, float]]:
 
 
 def pattern_diamond(n: int, angle: float = None) -> List[Tuple[float, float, float]]:
-    """Diamond lattice pattern with safe spacing."""
+    """Diamond lattice pattern."""
     if angle is None:
         angle = OPTIMAL_ANGLE
 
-    w, h = tree_bbox_at_angle(int(angle) % 360)
-    spacing = (max(w, h) + 0.02) * 0.75  # Diamond lattice has overlap in layout
-
+    spacing = 0.65
     placements = []
     size = int(math.ceil(math.sqrt(n * 2)))
 
@@ -1038,17 +1012,13 @@ def solve_n1() -> List[Tuple[float, float, float]]:
 
 
 def solve_n2(cfg: Config) -> List[Tuple[float, float, float]]:
-    """Optimized search for n=2."""
+    """Grid search for n=2."""
     best = None
     best_score = float('inf')
 
-    # Focus on promising angles (around optimal angle)
-    angles = [OPTIMAL_ANGLE, 0, 45, 90, 135]
-
-    for a1 in angles:
-        for a2 in angles:
-            # Find minimum valid spacing
-            for spacing in np.arange(0.50, 1.2, 0.005):
+    for a1 in range(0, 180, 3):
+        for a2 in range(0, 180, 3):
+            for spacing in np.arange(0.55, 1.1, 0.01):
                 p = [(0.0, 0.0, float(a1)), (spacing, 0.0, float(a2))]
 
                 if check_overlaps(p, cfg.collision_buffer):
@@ -1058,22 +1028,19 @@ def solve_n2(cfg: Config) -> List[Tuple[float, float, float]]:
                 if side < best_score:
                     best_score = side
                     best = p
-                break  # Found minimum spacing for this angle combo
 
-    return center(best) if best else center([(0.0, 0.0, float(OPTIMAL_ANGLE)), (0.7, 0.0, float(OPTIMAL_ANGLE))])
+    return center(best) if best else center([(0.0, 0.0, 45.0), (0.75, 0.0, 45.0)])
 
 
 def solve_n3(cfg: Config) -> List[Tuple[float, float, float]]:
-    """Optimized search for n=3."""
+    """Grid search for n=3 (triangle formations)."""
     best = None
     best_score = float('inf')
 
-    angles = [OPTIMAL_ANGLE, 0, 45, 90]
-
-    for angle in angles:
-        # Triangle formation
-        for sx in np.arange(0.50, 1.1, 0.01):
-            for sy in np.arange(0.35, 1.0, 0.01):
+    for angle in range(0, 180, 5):
+        for sx in np.arange(0.55, 1.0, 0.02):
+            for sy in np.arange(0.4, 1.0, 0.02):
+                # Triangle formation
                 p = [
                     (0.0, 0.0, float(angle)),
                     (sx, 0.0, float(angle)),
@@ -1088,37 +1055,18 @@ def solve_n3(cfg: Config) -> List[Tuple[float, float, float]]:
                     best_score = side
                     best = p
 
-        # Line formation
-        for spacing in np.arange(0.50, 0.9, 0.01):
-            p = [
-                (0.0, 0.0, float(angle)),
-                (spacing, 0.0, float(angle)),
-                (spacing * 2, 0.0, float(angle)),
-            ]
-
-            if check_overlaps(p, cfg.collision_buffer):
-                continue
-
-            side = bbox_side(p)
-            if side < best_score:
-                best_score = side
-                best = p
-
     return center(best) if best else center(pattern_grid(3))
 
 
 def solve_n4(cfg: Config) -> List[Tuple[float, float, float]]:
-    """Optimized search for n=4."""
+    """Grid search for n=4 (2x2 formations)."""
     best = None
     best_score = float('inf')
 
-    angles = [OPTIMAL_ANGLE, 0, 45, 90]
-
-    for angle in angles:
-        # 2x2 grid with offset
-        for sx in np.arange(0.50, 1.0, 0.01):
-            for sy in np.arange(0.50, 1.0, 0.01):
-                for offset in np.arange(0, sx / 2 + 0.01, sx / 4):
+    for angle in range(0, 180, 5):
+        for sx in np.arange(0.55, 1.0, 0.02):
+            for sy in np.arange(0.55, 1.0, 0.02):
+                for offset in np.arange(0, sx, 0.05):
                     p = [
                         (0.0, 0.0, float(angle)),
                         (sx, 0.0, float(angle)),
@@ -1134,23 +1082,6 @@ def solve_n4(cfg: Config) -> List[Tuple[float, float, float]]:
                         best_score = side
                         best = p
 
-        # Diamond formation
-        for spacing in np.arange(0.50, 0.9, 0.01):
-            p = [
-                (0.0, 0.0, float(angle)),
-                (spacing, 0.0, float(angle)),
-                (spacing / 2, spacing * 0.7, float(angle)),
-                (spacing * 1.5, spacing * 0.7, float(angle)),
-            ]
-
-            if check_overlaps(p, cfg.collision_buffer):
-                continue
-
-            side = bbox_side(p)
-            if side < best_score:
-                best_score = side
-                best = p
-
     return center(best) if best else center(pattern_grid(4))
 
 
@@ -1165,42 +1096,51 @@ def solve_small_n(n: int, cfg: Config, time_limit: float) -> List[Tuple[float, f
     elif n == 4:
         return solve_n4(cfg)
 
-    # For n > 4, use fast pattern + refinement
+    # For n > 4, use exhaustive initialization + optimization
     start_time = time.time()
     best = None
     best_score = float('inf')
 
-    # Try main patterns with optimal angle first
+    # Try many patterns
     patterns = [
-        pattern_grid(n, OPTIMAL_ANGLE),
-        pattern_hex(n, OPTIMAL_ANGLE),
-        pattern_grid(n, 0),
-        pattern_grid(n, 45),
+        pattern_grid(n),
+        pattern_hex(n),
+        pattern_spiral(n),
         pattern_concentric(n),
+        pattern_interlocked(n),
+        pattern_diamond(n),
     ]
 
+    # Also try different angles
+    for base_angle in [0, 15, 30, 45, 60, 75, 90]:
+        patterns.append(pattern_grid(n, base_angle))
+        patterns.append(pattern_hex(n, base_angle))
+
     for init in patterns:
-        if time.time() - start_time >= time_limit * 0.8:
+        if time.time() - start_time >= time_limit * 0.5:
             break
 
         if check_overlaps(init, cfg.collision_buffer):
             continue
 
-        side = bbox_side(init)
-        if side < best_score:
-            best_score = side
-            best = init
-
-    # Quick refinement on best
-    if best is not None:
         remaining = time_limit - (time.time() - start_time)
-        if remaining > 0.5:
-            best = simulated_annealing(best, cfg, remaining * 0.4, seed=n)
-            best = local_search(best, cfg, remaining * 0.2)
-            best = compact(best, cfg, remaining * 0.2)
 
-        if check_overlaps(best, cfg.collision_buffer):
-            best = pattern_grid(n)
+        # Optimize
+        if HAS_CMA and remaining > 1.0:
+            opt = CMAOptimizer(n, cfg)
+            result = opt.optimize(init, remaining * 0.2)
+        else:
+            result = simulated_annealing(init, cfg, remaining * 0.2)
+
+        result = local_search(result, cfg, remaining * 0.1)
+        result = compact(result, cfg, remaining * 0.05)
+        result = local_search(result, cfg, remaining * 0.05)
+
+        if not check_overlaps(result, cfg.collision_buffer):
+            side = bbox_side(result)
+            if side < best_score:
+                best_score = side
+                best = result
 
     return center(best) if best else center(pattern_grid(n))
 
@@ -1237,43 +1177,77 @@ class EliteSolverV3:
         best = None
         best_score = float('inf')
 
-        # Generate initializations - prioritize best patterns
+        # Generate initializations
         inits = [
-            pattern_grid(n, OPTIMAL_ANGLE),
-            pattern_grid(n, 0),
-            pattern_grid(n, 45),
-            pattern_hex(n, OPTIMAL_ANGLE),
-            pattern_concentric(n),
+            ('grid', pattern_grid(n)),
+            ('hex', pattern_hex(n)),
+            ('spiral', pattern_spiral(n)),
+            ('concentric', pattern_concentric(n)),
+            ('interlocked', pattern_interlocked(n)),
+            ('diamond', pattern_diamond(n)),
         ]
 
-        # Find best initial pattern
-        for init in inits:
+        # Add different angle variants
+        for angle in [0, 30, 60, 90]:
+            inits.append((f'grid_{angle}', pattern_grid(n, angle)))
+
+        # Add NFP-based initialization
+        if self.nfp_placer and time.time() - start_time < time_budget * 0.2:
+            try:
+                nfp_init = self.nfp_placer.place(n)
+                inits.append(('nfp', nfp_init))
+            except:
+                pass
+
+        # Multi-restart optimization
+        time_per_restart = time_budget / max(1, self.cfg.num_restarts)
+
+        for restart in range(self.cfg.num_restarts):
+            if time.time() - start_time >= time_budget * 0.92:
+                break
+
+            # Select initialization
+            if restart < len(inits):
+                name, init = inits[restart]
+            elif best is not None:
+                # Perturb best
+                init = self.perturb(best, 0.08 * best_score)
+            else:
+                init = inits[restart % len(inits)][1]
+
             if check_overlaps(init, self.cfg.collision_buffer):
                 continue
-            side = bbox_side(init)
-            if side < best_score:
-                best_score = side
-                best = init
 
-        if best is None:
-            return center(pattern_grid(n))
+            remaining = min(time_per_restart, time_budget - (time.time() - start_time))
 
-        # Quick optimization
-        remaining = time_budget - (time.time() - start_time)
-        if remaining > 0.5:
-            # Use SA for main optimization (faster than CMA-ES)
-            best = simulated_annealing(best, self.cfg, remaining * 0.5, seed=n)
+            # CMA-ES or SA optimization
+            if HAS_CMA and remaining > 1.0:
+                opt = CMAOptimizer(n, self.cfg)
+                result = opt.optimize(init, remaining * 0.4)
+            else:
+                result = simulated_annealing(init, self.cfg, remaining * 0.4, seed=restart)
 
-        remaining = time_budget - (time.time() - start_time)
-        if remaining > 0.3:
-            best = local_search(best, self.cfg, remaining * 0.4)
-            best = compact(best, self.cfg, remaining * 0.3)
+            # Refinement
+            remaining = time_budget - (time.time() - start_time)
+            if remaining > 0.5:
+                result = local_search(result, self.cfg, remaining * 0.12)
+                result = compact(result, self.cfg, remaining * 0.08)
+                result = local_search(result, self.cfg, remaining * 0.05)
 
-        # Verify no overlaps
-        if check_overlaps(best, self.cfg.collision_buffer):
-            best = pattern_grid(n)
+            if not check_overlaps(result, self.cfg.collision_buffer):
+                side = bbox_side(result)
+                if side < best_score:
+                    best_score = side
+                    best = result
 
-        return center(best)
+        # Final polish
+        if best is not None:
+            remaining = time_budget - (time.time() - start_time)
+            if remaining > 0.5:
+                best = compact(best, self.cfg, remaining * 0.4)
+                best = local_search(best, self.cfg, remaining * 0.3)
+
+        return center(best) if best else center(pattern_grid(n))
 
     def perturb(self, placements: List[Tuple[float, float, float]],
                 magnitude: float) -> List[Tuple[float, float, float]]:
