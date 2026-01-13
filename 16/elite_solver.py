@@ -12,10 +12,10 @@ Combines multiple advanced optimization techniques:
 6. Basin Hopping - Escape local minima
 
 Usage:
-    python elite_solver.py [--output submission.csv] [--hours 24]
+    python elite_solver.py [--output submission.csv]   # Default: optimal 48h run
     python elite_solver.py --quick      # Fast test (~2 hours)
     python elite_solver.py --standard   # Standard (~12 hours)
-    python elite_solver.py --ultra      # Maximum quality (~48 hours)
+    python elite_solver.py --hours 24   # Custom time limit
 
 Requirements:
     pip install numpy shapely pyclipper tqdm ortools
@@ -128,47 +128,51 @@ def make_tree_polygon_fast(x: float, y: float, angle_deg: float) -> Polygon:
 
 @dataclass
 class EliteConfig:
-    """Configuration for elite solver."""
+    """Configuration for elite solver.
 
-    # Time management
-    max_hours: float = 24.0
-    time_per_puzzle_base: float = 60.0
-    priority_multiplier: float = 10.0
+    Default settings are optimized for best results (~48 hours runtime).
+    Use --quick for faster (~2h) or --standard for moderate (~12h) runs.
+    """
 
-    # Genetic Algorithm
-    ga_population_size: int = 50
-    ga_generations: int = 100
+    # Time management - Default to 48 hours for optimal results
+    max_hours: float = 48.0
+    time_per_puzzle_base: float = 180.0
+    priority_multiplier: float = 15.0
+
+    # Genetic Algorithm - Large population for better exploration
+    ga_population_size: int = 80
+    ga_generations: int = 200
     ga_mutation_rate: float = 0.15
     ga_crossover_rate: float = 0.7
     ga_elite_count: int = 5
     ga_tournament_size: int = 5
 
-    # Simulated Annealing
+    # Simulated Annealing - More iterations for convergence
     sa_initial_temp: float = 5.0
     sa_final_temp: float = 1e-8
-    sa_iterations: int = 5000
+    sa_iterations: int = 10000
     sa_cooling_rate: float = 0.9995
 
-    # Local Search
+    # Local Search - Fine-grained refinement
     local_precision: float = 0.0001
-    local_iterations: int = 3000
+    local_iterations: int = 5000
 
-    # Basin Hopping
-    basin_hops: int = 20
+    # Basin Hopping - More hops to escape local minima
+    basin_hops: int = 40
     basin_perturbation: float = 0.15
 
     # Placement
     collision_buffer: float = 0.001
-    num_restarts: int = 50
+    num_restarts: int = 100
 
     # Pattern-based
     use_patterns: bool = True
     use_interlocking: bool = True
 
-    # OR-Tools (for small n)
+    # OR-Tools (for small n) - More time for exact solutions
     use_ortools: bool = True
     ortools_max_n: int = 8
-    ortools_time_limit: float = 60.0
+    ortools_time_limit: float = 300.0
 
     # NFP
     use_nfp: bool = True
