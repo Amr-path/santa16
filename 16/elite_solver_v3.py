@@ -3,11 +3,12 @@
 Santa 2025 - ELITE Solver V3 (Target: Score 62)
 ================================================
 
-Key improvements:
-1. Zero collision buffer (touching is OK)
-2. Greedy bottom-left placement with NFP
-3. Multiple angle combinations tested
-4. Aggressive local optimization
+Key features:
+1. Multi-core parallel processing (uses all CPU cores)
+2. Zero collision buffer (touching is OK)
+3. Greedy placement minimizing bounding box
+4. Multiple angle combinations tested
+5. Simulated annealing + local optimization
 
 Tree area = 0.2456
 Theoretical minimum score (100% efficiency) = 49
@@ -17,6 +18,7 @@ Usage:
     python elite_solver_v3.py [--output submission.csv]
     python elite_solver_v3.py --quick      # Fast test (~1 hour)
     python elite_solver_v3.py --hours 24   # Custom time limit
+    python elite_solver_v3.py --workers 8  # Use 8 cores
 """
 
 import os
@@ -25,6 +27,8 @@ import math
 import time
 import random
 import argparse
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from functools import lru_cache
@@ -171,21 +175,18 @@ class NFPCalculator:
         return None
 
 
-NFP = NFPCalculator()
-
-
 # =============================================================================
-# GREEDY BOTTOM-LEFT PLACER
+# GREEDY PLACER
 # =============================================================================
 
 class GreedyPlacer:
-    """Bottom-left greedy placement with multiple angles."""
+    """Greedy placement minimizing bounding box."""
 
     def __init__(self):
-        self.nfp = NFP
+        self.nfp = NFPCalculator()
 
-    def place_bottom_left(self, n: int, angles: List[float]) -> List[Tuple[float, float, float]]:
-        """Place trees using bottom-left heuristic."""
+    def place_greedy(self, n: int, angles: List[float]) -> List[Tuple[float, float, float]]:
+        """Place trees using greedy heuristic."""
         placements = []
         polys = []
 
@@ -265,22 +266,6 @@ class GreedyPlacer:
 
         return best_pos
 
-    def place_best_of_angles(self, n: int, angle_sets: List[List[float]]) -> List[Tuple[float, float, float]]:
-        """Try multiple angle configurations and return best."""
-        best_placements = None
-        best_side = float('inf')
-
-        for angles in angle_sets:
-            placements = self.place_bottom_left(n, angles)
-            if has_any_collision(placements):
-                continue
-            side = compute_side(placements)
-            if side < best_side:
-                best_side = side
-                best_placements = placements
-
-        return best_placements if best_placements else self.place_bottom_left(n, [45])
-
 
 # =============================================================================
 # LOCAL OPTIMIZER
@@ -359,8 +344,9 @@ class SimulatedAnnealing:
     """SA for global optimization."""
 
     def optimize(self, placements: List[Tuple[float, float, float]],
-                time_limit: float, temp: float = 0.5) -> List[Tuple[float, float, float]]:
+                time_limit: float, temp: float = 0.5, seed: int = 42) -> List[Tuple[float, float, float]]:
         """Run simulated annealing."""
+        rng = random.Random(seed)
         start = time.time()
         n = len(placements)
         if n == 0:
@@ -375,19 +361,19 @@ class SimulatedAnnealing:
 
         while time.time() - start < time_limit and temp > 1e-6:
             # Generate neighbor
-            idx = random.randint(0, n - 1)
+            idx = rng.randint(0, n - 1)
             x, y, a = current[idx]
 
-            move = random.choice(['pos', 'angle', 'swap'])
+            move = rng.choice(['pos', 'angle', 'swap'])
             if move == 'pos':
-                nx = x + random.gauss(0, 0.03)
-                ny = y + random.gauss(0, 0.03)
+                nx = x + rng.gauss(0, 0.03)
+                ny = y + rng.gauss(0, 0.03)
                 neighbor = current[:idx] + [(nx, ny, a)] + current[idx+1:]
             elif move == 'angle':
-                na = (a + random.choice([15, 30, 45, 90, 180])) % 360
+                na = (a + rng.choice([15, 30, 45, 90, 180])) % 360
                 neighbor = current[:idx] + [(x, y, na)] + current[idx+1:]
             else:  # swap
-                j = random.randint(0, n - 1)
+                j = rng.randint(0, n - 1)
                 neighbor = list(current)
                 neighbor[idx], neighbor[j] = neighbor[j], neighbor[idx]
 
@@ -398,7 +384,7 @@ class SimulatedAnnealing:
             neighbor_side = compute_side(neighbor)
             delta = neighbor_side - current_side
 
-            if delta < 0 or random.random() < math.exp(-delta / temp):
+            if delta < 0 or rng.random() < math.exp(-delta / temp):
                 current = neighbor
                 current_side = neighbor_side
                 if current_side < best_side:
@@ -411,86 +397,106 @@ class SimulatedAnnealing:
 
 
 # =============================================================================
+# WORKER FUNCTION FOR PARALLEL PROCESSING
+# =============================================================================
+
+def solve_puzzle_worker(args: Tuple[int, float, int]) -> Tuple[int, List[Tuple[float, float, float]], float]:
+    """Worker function to solve a single puzzle (for parallel execution)."""
+    n, time_budget, seed = args
+
+    if n == 0:
+        return (n, [], 0.0)
+
+    rng = random.Random(seed)
+    np.random.seed(seed)
+
+    placer = GreedyPlacer()
+    local = LocalOptimizer()
+    sa = SimulatedAnnealing()
+
+    start = time.time()
+    best = None
+    best_side = float('inf')
+
+    # Angle configurations to try
+    angle_configs = [
+        [45],  # All 45°
+        [0, 180],  # Alternating up/down
+        [45, 225],  # Alternating diagonal
+        [0, 90, 180, 270],  # All cardinal
+        [30, 210],
+        [60, 240],
+    ]
+
+    # 1. Try greedy placement with different angles
+    for config in angle_configs:
+        if time.time() - start > time_budget * 0.3:
+            break
+        try:
+            placements = placer.place_greedy(n, config)
+            if not has_any_collision(placements):
+                side = compute_side(placements)
+                if side < best_side:
+                    best = placements
+                    best_side = side
+        except:
+            continue
+
+    if best is None:
+        best = placer.place_greedy(n, [45])
+
+    # 2. Simulated annealing
+    remaining = time_budget - (time.time() - start)
+    if remaining > 0.5:
+        sa_result = sa.optimize(best, remaining * 0.5, seed=seed)
+        if not has_any_collision(sa_result):
+            side = compute_side(sa_result)
+            if side < best_side:
+                best = sa_result
+                best_side = side
+
+    # 3. Local optimization
+    remaining = time_budget - (time.time() - start)
+    if remaining > 0.1:
+        local_result = local.optimize(best, remaining * 0.9)
+        if not has_any_collision(local_result):
+            side = compute_side(local_result)
+            if side < best_side:
+                best = local_result
+                best_side = side
+
+    contrib = (best_side ** 2) / n
+    return (n, best, contrib)
+
+
+# =============================================================================
 # MAIN SOLVER
 # =============================================================================
 
 @dataclass
 class Config:
     max_hours: float = 24.0
+    workers: int = 0  # 0 = auto-detect
     seed: int = 42
 
 
 class EliteSolverV3:
-    """Main solver."""
+    """Main solver with parallel processing."""
 
     def __init__(self, config: Config):
         self.config = config
-        self.placer = GreedyPlacer()
-        self.local = LocalOptimizer()
-        self.sa = SimulatedAnnealing()
+
+        # Auto-detect workers
+        if config.workers <= 0:
+            self.num_workers = max(1, mp.cpu_count() - 1)
+        else:
+            self.num_workers = config.workers
+
         random.seed(config.seed)
         np.random.seed(config.seed)
 
-    def solve_puzzle(self, n: int, time_budget: float) -> List[Tuple[float, float, float]]:
-        """Solve single puzzle."""
-        if n == 0:
-            return []
-
-        start = time.time()
-        best = None
-        best_side = float('inf')
-
-        # Angle configurations to try
-        angle_configs = [
-            [45],  # All 45°
-            [0, 180],  # Alternating up/down
-            [45, 225],  # Alternating diagonal
-            [0, 90, 180, 270],  # All cardinal
-            [30, 210],
-            [60, 240],
-        ]
-
-        # 1. Try greedy placement with different angles
-        for config in angle_configs:
-            if time.time() - start > time_budget * 0.3:
-                break
-            try:
-                placements = self.placer.place_bottom_left(n, config)
-                if not has_any_collision(placements):
-                    side = compute_side(placements)
-                    if side < best_side:
-                        best = placements
-                        best_side = side
-            except:
-                continue
-
-        if best is None:
-            best = self.placer.place_bottom_left(n, [45])
-
-        # 2. Simulated annealing
-        remaining = time_budget - (time.time() - start)
-        if remaining > 0.5:
-            sa_result = self.sa.optimize(best, remaining * 0.5)
-            if not has_any_collision(sa_result):
-                side = compute_side(sa_result)
-                if side < best_side:
-                    best = sa_result
-                    best_side = side
-
-        # 3. Local optimization
-        remaining = time_budget - (time.time() - start)
-        if remaining > 0.1:
-            local_result = self.local.optimize(best, remaining * 0.9)
-            if not has_any_collision(local_result):
-                side = compute_side(local_result)
-                if side < best_side:
-                    best = local_result
-                    best_side = side
-
-        return best
-
     def solve_all(self, output: str = "submission_v3.csv") -> Dict[int, List[Tuple[float, float, float]]]:
-        """Solve all puzzles."""
+        """Solve all puzzles using parallel processing."""
         solutions = {}
         total_score = 0.0
 
@@ -501,33 +507,55 @@ class EliteSolverV3:
         priorities = {n: 1.0 + 14.0 * (200 - n) / 199 for n in range(1, 201)}
         total_priority = sum(priorities.values())
 
-        pbar = tqdm(range(1, 201), desc="Solving") if HAS_TQDM else range(1, 201)
-
-        for n in pbar:
-            elapsed = time.time() - start
-            if elapsed >= max_time:
-                print(f"\nTime limit at n={n}")
-                break
-
-            remaining = max_time - elapsed
-            rem_priority = sum(priorities[k] for k in range(n, 201))
-            budget = min(remaining * priorities[n] / rem_priority, 300)
-
-            placements = self.solve_puzzle(n, budget)
-            solutions[n] = placements
-
-            side = compute_side(placements)
-            contrib = (side ** 2) / n
-            total_score += contrib
-
-            if HAS_TQDM:
-                pbar.set_postfix({'score': f'{total_score:.2f}', 'side': f'{side:.4f}'})
-
-        # Fill missing
+        # Calculate time budgets for each puzzle
+        time_budgets = {}
+        remaining_time = max_time
         for n in range(1, 201):
-            if n not in solutions:
-                solutions[n] = self.placer.place_bottom_left(n, [45])
+            rem_priority = sum(priorities[k] for k in range(n, 201))
+            budget = min(remaining_time * priorities[n] / rem_priority, 600)
+            time_budgets[n] = budget
+            remaining_time -= budget
 
+        print(f"Using {self.num_workers} workers")
+        print(f"Total time budget: {max_time/3600:.1f} hours")
+        print()
+
+        # Create tasks: (n, time_budget, seed)
+        tasks = [(n, time_budgets[n], self.config.seed + n) for n in range(1, 201)]
+
+        # Process in parallel with progress tracking
+        if self.num_workers > 1:
+            # Parallel mode
+            completed = 0
+            with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+                futures = {executor.submit(solve_puzzle_worker, task): task[0] for task in tasks}
+
+                pbar = tqdm(total=200, desc="Solving") if HAS_TQDM else None
+
+                for future in as_completed(futures):
+                    n, placements, contrib = future.result()
+                    solutions[n] = placements
+                    total_score += contrib
+                    completed += 1
+
+                    if pbar:
+                        pbar.update(1)
+                        pbar.set_postfix({'score': f'{total_score:.2f}', 'done': completed})
+
+                if pbar:
+                    pbar.close()
+        else:
+            # Sequential mode (single worker)
+            pbar = tqdm(tasks, desc="Solving") if HAS_TQDM else tasks
+            for task in pbar:
+                n, placements, contrib = solve_puzzle_worker(task)
+                solutions[n] = placements
+                total_score += contrib
+
+                if HAS_TQDM:
+                    pbar.set_postfix({'score': f'{total_score:.2f}', 'n': n})
+
+        # Save results
         self.save(solutions, output)
         return solutions
 
@@ -548,30 +576,38 @@ class EliteSolverV3:
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--output', '-o', default='submission_v3.csv')
-    parser.add_argument('--quick', action='store_true')
-    parser.add_argument('--hours', type=float, default=24.0)
-    parser.add_argument('--seed', type=int, default=42)
+    parser = argparse.ArgumentParser(description='Santa 2025 Elite Solver V3 (Multi-core)')
+    parser.add_argument('--output', '-o', default='submission_v3.csv', help='Output file')
+    parser.add_argument('--quick', action='store_true', help='Quick mode (~1 hour)')
+    parser.add_argument('--hours', type=float, default=24.0, help='Time limit in hours')
+    parser.add_argument('--workers', type=int, default=0, help='Number of workers (0=auto)')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
     args = parser.parse_args()
 
     config = Config(
         max_hours=1.0 if args.quick else args.hours,
+        workers=args.workers,
         seed=args.seed,
     )
 
     print("=" * 50)
-    print("ELITE SOLVER V3")
+    print("ELITE SOLVER V3 (Multi-core)")
+    print("=" * 50)
     print(f"Hours: {config.max_hours}")
+    print(f"Workers: {config.workers if config.workers > 0 else 'auto'}")
     print(f"NFP: {'YES' if HAS_PYCLIPPER else 'NO'}")
+    print(f"Seed: {config.seed}")
     print("=" * 50)
 
     solver = EliteSolverV3(config)
     solutions = solver.solve_all(args.output)
 
     score = sum((compute_side(solutions[n])**2)/n for n in solutions)
-    print(f"\nFINAL SCORE: {score:.4f}")
+    print()
+    print("=" * 50)
+    print(f"FINAL SCORE: {score:.4f}")
     print(f"Saved: {args.output}")
+    print("=" * 50)
 
 
 if __name__ == '__main__':
