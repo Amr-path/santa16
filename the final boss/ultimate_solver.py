@@ -1,30 +1,24 @@
 #!/usr/bin/env python3
 """
-Santa 2025 - ULTIMATE Solver (Self-Contained)
-==============================================
+Santa 2025 - ULTIMATE Solver (Fixed - Independent & Parallel)
+==============================================================
 
-The single best optimization solver combining all techniques:
-- No-Fit Polygon (NFP) placement using pyclipper
-- Radial greedy placement with fine-stepping
-- Hexagonal grid placement (optimal for packing)
-- Boundary placement along convex hull
-- Priority-based time allocation (more time for low-n puzzles)
-- Multi-restart strategy with diverse seeds
-- Simulated Annealing with 6 move types
-- Ultra-fine local search (0.0003 precision)
-- Aggressive compacting toward centroid
-- Basin hopping for escaping local minima
-- STRtree spatial indexing for fast collision detection
-- Live progress bar for real-time monitoring
+FIXED VERSION: Each puzzle solved independently with multi-core parallelism.
+
+Key improvements over previous version:
+- Independent puzzle solving (NOT incremental)
+- 15-core parallel processing by default
+- Better initial placement strategies
+- More aggressive optimization for small n
 
 Usage:
-    python ultimate_solver.py [--output submission.csv] [--seed 42]
-    python ultimate_solver.py --quick    # Fast test run (~1-2 hours)
-    python ultimate_solver.py --standard # Standard run (~6-12 hours)
-    python ultimate_solver.py --ultra    # Maximum quality (~24-48 hours)
+    python ultimate_solver.py --output submission.csv --cores 15
+    python ultimate_solver.py --quick --cores 15     # Fast test (~1-2 hours)
+    python ultimate_solver.py --standard --cores 15  # Standard (~6-12 hours)
+    python ultimate_solver.py --ultra --cores 15     # Maximum (~24-48 hours)
 
 Requirements:
-    pip install numpy shapely pyclipper tqdm
+    pip install numpy shapely tqdm
 """
 
 import os
@@ -33,23 +27,17 @@ import math
 import time
 import random
 import argparse
+import signal
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
 
 import numpy as np
-from shapely.geometry import Polygon, Point
+from shapely.geometry import Polygon
 from shapely import affinity
-from shapely.strtree import STRtree
 from shapely.ops import unary_union
 
-# Try to import pyclipper for NFP computation
-try:
-    import pyclipper
-    HAS_PYCLIPPER = True
-except ImportError:
-    HAS_PYCLIPPER = False
-
-# Try to import tqdm for progress bar
 try:
     from tqdm import tqdm
     HAS_TQDM = True
@@ -62,31 +50,28 @@ except ImportError:
 # =============================================================================
 
 @dataclass
-class UltimateConfig:
-    """Configuration for ultimate optimization."""
+class Config:
+    """Solver configuration."""
+    # Parallelism
+    num_cores: int = 15
 
-    # Time budgets
-    base_time_per_puzzle: float = 30.0    # Base time per puzzle (seconds)
-    priority_multiplier: float = 8.0       # n=1 gets 8x more time than n=200
-    max_total_hours: float = 24.0          # Maximum total runtime
+    # Time budgets (will be distributed based on priority)
+    total_time_hours: float = 12.0
 
-    # Multi-restart
-    base_restarts: int = 100               # Restarts for n=200
-    priority_restarts: int = 500           # Extra restarts for n=1
-    num_seeds: int = 5                     # Seeds per restart batch
+    # Multi-restart per puzzle
+    restarts_small: int = 200    # n=1-10
+    restarts_medium: int = 100   # n=11-50
+    restarts_large: int = 50     # n=51-200
 
     # Placement
-    num_placement_attempts: int = 300
-    start_radius: float = 20.0
-    step_in: float = 0.05
-    step_out: float = 0.001
+    placement_attempts: int = 200
 
     # Collision
-    collision_buffer: float = 0.012
+    collision_buffer: float = 0.01
 
     # Simulated Annealing
-    sa_temp_initial: float = 3.0
-    sa_temp_final: float = 0.0000001
+    sa_temp_initial: float = 2.5
+    sa_temp_final: float = 1e-9
 
     # Local search
     local_precision: float = 0.0003
@@ -96,112 +81,90 @@ class UltimateConfig:
     compact_passes: int = 40
     compact_step: float = 0.0002
 
-    # Basin hopping
-    basin_hops: int = 15
-    basin_perturbation: float = 0.12
-
-    # NFP
-    use_nfp: bool = True
-    nfp_precision: int = 1000
-
-    # Checkpointing
-    checkpoint_interval: int = 10
-    checkpoint_path: str = "checkpoint.csv"
-
     seed: int = 42
 
-    def get_time_for_n(self, n: int) -> float:
-        """Get time budget for puzzle n (more for smaller n)."""
-        priority = 1.0 + (self.priority_multiplier - 1.0) * (200 - n) / 199
-        return self.base_time_per_puzzle * priority
 
-    def get_restarts_for_n(self, n: int) -> int:
-        """Get restarts for puzzle n (more for smaller n)."""
-        extra = int((self.priority_restarts - self.base_restarts) * (200 - n) / 199)
-        return self.base_restarts + extra
-
-
-def quick_config() -> UltimateConfig:
+def quick_config() -> Config:
     """Quick test mode (~1-2 hours)."""
-    return UltimateConfig(
-        base_time_per_puzzle=8.0,
-        priority_multiplier=5.0,
-        max_total_hours=2.0,
-        base_restarts=20,
-        priority_restarts=100,
-        num_placement_attempts=100,
-        local_iterations=500,
-        compact_passes=15,
-        basin_hops=5,
-        checkpoint_interval=20
+    return Config(
+        total_time_hours=2.0,
+        restarts_small=50,
+        restarts_medium=25,
+        restarts_large=15,
+        placement_attempts=80,
+        local_iterations=800,
+        compact_passes=20,
     )
 
 
-def standard_config() -> UltimateConfig:
+def standard_config() -> Config:
     """Standard mode (~6-12 hours)."""
-    return UltimateConfig()
+    return Config(
+        total_time_hours=12.0,
+        restarts_small=200,
+        restarts_medium=100,
+        restarts_large=50,
+    )
 
 
-def ultra_config() -> UltimateConfig:
+def ultra_config() -> Config:
     """Ultra quality mode (~24-48 hours)."""
-    return UltimateConfig(
-        base_time_per_puzzle=120.0,
-        priority_multiplier=15.0,
-        max_total_hours=48.0,
-        base_restarts=300,
-        priority_restarts=2000,
-        num_placement_attempts=500,
-        step_in=0.03,
-        step_out=0.0005,
-        collision_buffer=0.01,
+    return Config(
+        total_time_hours=48.0,
+        restarts_small=500,
+        restarts_medium=250,
+        restarts_large=100,
+        placement_attempts=400,
+        collision_buffer=0.008,
         local_precision=0.0002,
-        local_iterations=5000,
+        local_iterations=4000,
         compact_passes=80,
         compact_step=0.0001,
-        basin_hops=30,
-        basin_perturbation=0.15,
-        checkpoint_interval=5
     )
 
 
 # =============================================================================
-# GEOMETRY - Tree Polygon Definition
+# GEOMETRY
 # =============================================================================
 
 TREE_COORDS = [
-    (0.0, 0.8),        # tip
-    (0.125, 0.5),      # top tier outer right
-    (0.0625, 0.5),     # top tier inner right
-    (0.2, 0.25),       # middle tier outer right
-    (0.1, 0.25),       # middle tier inner right
-    (0.35, 0.0),       # bottom tier outer right
-    (0.075, 0.0),      # trunk top right
-    (0.075, -0.2),     # trunk bottom right
-    (-0.075, -0.2),    # trunk bottom left
-    (-0.075, 0.0),     # trunk top left
-    (-0.35, 0.0),      # bottom tier outer left
-    (-0.1, 0.25),      # middle tier inner left
-    (-0.2, 0.25),      # middle tier outer left
-    (-0.0625, 0.5),    # top tier inner left
-    (-0.125, 0.5),     # top tier outer left
+    (0.0, 0.8),
+    (0.125, 0.5),
+    (0.0625, 0.5),
+    (0.2, 0.25),
+    (0.1, 0.25),
+    (0.35, 0.0),
+    (0.075, 0.0),
+    (0.075, -0.2),
+    (-0.075, -0.2),
+    (-0.075, 0.0),
+    (-0.35, 0.0),
+    (-0.1, 0.25),
+    (-0.2, 0.25),
+    (-0.0625, 0.5),
+    (-0.125, 0.5),
 ]
 
 BASE_POLYGON = Polygon(TREE_COORDS)
+TREE_AREA = BASE_POLYGON.area
 
-# Pre-compute rotated polygons (every 1 degree for precision)
-ROTATED_POLYGONS = {deg: affinity.rotate(BASE_POLYGON, deg, origin=(0, 0))
-                    for deg in range(0, 360, 1)}
+# Pre-compute rotated polygons
+ROTATED_POLYGONS = {}
+for deg in range(360):
+    ROTATED_POLYGONS[deg] = affinity.rotate(BASE_POLYGON, deg, origin=(0, 0))
 
 
 def make_tree(x: float, y: float, deg: float) -> Polygon:
     """Create tree polygon at position with rotation."""
     snapped = int(round(deg)) % 360
     poly = ROTATED_POLYGONS[snapped]
-    return affinity.translate(poly, xoff=x, yoff=y) if x != 0 or y != 0 else poly
+    if x != 0 or y != 0:
+        return affinity.translate(poly, xoff=x, yoff=y)
+    return poly
 
 
 def collides(poly: Polygon, others: List[Polygon], buf: float = 0.0) -> bool:
-    """Check if polygon collides with any other polygon."""
+    """Check collision with buffer."""
     for o in others:
         if buf > 0:
             if poly.distance(o) < buf:
@@ -211,36 +174,23 @@ def collides(poly: Polygon, others: List[Polygon], buf: float = 0.0) -> bool:
     return False
 
 
-def collides_fast(poly: Polygon, tree_idx: STRtree, all_polys: List[Polygon], buf: float = 0.0) -> bool:
-    """Fast collision check using spatial index."""
-    query = poly.buffer(buf) if buf > 0 else poly
-    for idx in tree_idx.query(query):
-        if buf > 0:
-            if poly.distance(all_polys[idx]) < buf:
-                return True
-        elif poly.intersects(all_polys[idx]) and not poly.touches(all_polys[idx]):
-            return True
-    return False
-
-
 def bbox_side(placements: List[Tuple[float, float, float]]) -> float:
-    """Compute bounding square side from placements."""
+    """Compute bounding square side."""
     if not placements:
         return 0.0
     polys = [make_tree(x, y, d) for x, y, d in placements]
-    b = unary_union(polys).bounds
-    return max(b[2] - b[0], b[3] - b[1])
+    return bbox_side_polys(polys)
 
 
 def bbox_side_polys(polys: List[Polygon]) -> float:
-    """Compute bounding square side from polygon list."""
+    """Compute bounding square side from polygons."""
     if not polys:
         return 0.0
     b = unary_union(polys).bounds
     return max(b[2] - b[0], b[3] - b[1])
 
 
-def center(placements: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
+def center_placements(placements: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
     """Center placements around origin."""
     if not placements:
         return placements
@@ -264,245 +214,186 @@ def check_overlaps(placements: List[Tuple[float, float, float]], buf: float = 0.
 
 
 # =============================================================================
-# NO-FIT POLYGON (NFP) COMPUTATION
+# INITIAL PLACEMENT STRATEGIES
 # =============================================================================
 
-class NFPComputer:
-    """No-Fit Polygon computation using pyclipper (Minkowski sum)."""
+def greedy_radial_placement(n: int, cfg: Config, seed: int) -> List[Tuple[float, float, float]]:
+    """Greedy placement using radial approach."""
+    random.seed(seed)
 
-    def __init__(self, precision: int = 1000):
-        self.precision = precision
-        self.cache = {}
+    if n == 0:
+        return []
+    if n == 1:
+        return [(0.0, 0.0, random.randint(0, 359))]
 
-    def _to_clipper(self, coords: List[Tuple[float, float]]) -> List[Tuple[int, int]]:
-        return [(int(x * self.precision), int(y * self.precision)) for x, y in coords]
+    buf = cfg.collision_buffer
+    placements = []
+    polys = []
 
-    def _from_clipper(self, coords: List[Tuple[int, int]]) -> List[Tuple[float, float]]:
-        return [(x / self.precision, y / self.precision) for x, y in coords]
+    # First tree at origin
+    deg = random.randint(0, 359)
+    placements.append((0.0, 0.0, deg))
+    polys.append(make_tree(0.0, 0.0, deg))
 
-    def _negate_polygon(self, coords: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        return [(-x, -y) for x, y in coords]
-
-    def compute_nfp(self, fixed_poly: Polygon, moving_poly: Polygon) -> Optional[Polygon]:
-        """Compute NFP using Minkowski sum."""
-        if not HAS_PYCLIPPER:
-            return None
-
-        try:
-            fixed_coords = list(fixed_poly.exterior.coords)[:-1]
-            moving_coords = list(moving_poly.exterior.coords)[:-1]
-
-            neg_moving = self._negate_polygon(moving_coords)
-            fixed_int = self._to_clipper(fixed_coords)
-            moving_int = self._to_clipper(neg_moving)
-
-            result = pyclipper.MinkowskiSum(fixed_int, moving_int, True)
-
-            if result and len(result) > 0:
-                nfp_coords = self._from_clipper(result[0])
-                return Polygon(nfp_coords)
-        except Exception:
-            pass
-
-        return None
-
-    def compute_combined_nfp(self, fixed_polys: List[Polygon], moving_poly: Polygon):
-        """Compute combined NFP for multiple fixed polygons."""
-        nfps = []
-        for fp in fixed_polys:
-            nfp = self.compute_nfp(fp, moving_poly)
-            if nfp and nfp.is_valid:
-                nfps.append(nfp)
-
-        if nfps:
-            return unary_union(nfps)
-        return None
-
-    def find_valid_position(self, nfp, center: Tuple[float, float] = (0, 0),
-                            num_samples: int = 150) -> Optional[Tuple[float, float]]:
-        """Find valid position on NFP boundary closest to center."""
-        if nfp is None:
-            return None
-
-        cx, cy = center
+    for i in range(1, n):
         best_pos = None
         best_dist = float('inf')
 
-        boundary = nfp.exterior if hasattr(nfp, 'exterior') else nfp.boundary
-        length = boundary.length
+        for _ in range(cfg.placement_attempts):
+            angle = random.uniform(0, 2 * math.pi)
+            deg = random.randint(0, 359)
 
-        for i in range(num_samples):
-            t = i / num_samples
-            point = boundary.interpolate(t * length)
-            px, py = point.x, point.y
+            # Binary search for closest valid position
+            r_min, r_max = 0.0, 10.0
 
-            dx = px - cx
-            dy = py - cy
-            dist = math.sqrt(dx*dx + dy*dy)
+            for _ in range(20):
+                r = (r_min + r_max) / 2
+                x = r * math.cos(angle)
+                y = r * math.sin(angle)
+                poly = make_tree(x, y, deg)
 
-            if dist > 0:
-                offset = 0.015
-                test_x = px + offset * dx / dist
-                test_y = py + offset * dy / dist
+                if collides(poly, polys, buf):
+                    r_min = r
+                else:
+                    r_max = r
 
-                test_point = Point(test_x, test_y)
-                if not nfp.contains(test_point):
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_pos = (test_x, test_y)
-
-        return best_pos
-
-
-nfp_computer = NFPComputer(precision=1000)
-
-
-# =============================================================================
-# PLACEMENT STRATEGIES
-# =============================================================================
-
-def weighted_angle() -> float:
-    """Generate angle weighted toward corners."""
-    while True:
-        a = random.uniform(0, 2 * math.pi)
-        if random.random() < abs(math.sin(2 * a)):
-            return a
-
-
-def place_radial(base: Polygon, existing: List[Polygon], cfg: UltimateConfig) -> Tuple[float, float]:
-    """Place tree using radial greedy approach."""
-    if not existing:
-        return 0.0, 0.0
-
-    idx = STRtree(existing)
-    best = (None, None)
-    min_r = float('inf')
-
-    for _ in range(cfg.num_placement_attempts):
-        a = weighted_angle()
-        vx, vy = math.cos(a), math.sin(a)
-
-        r = cfg.start_radius
-        found = False
-
-        while r >= 0:
-            px, py = r * vx, r * vy
-            cand = affinity.translate(base, xoff=px, yoff=py)
-            if collides_fast(cand, idx, existing, cfg.collision_buffer):
-                found = True
-                break
-            r -= cfg.step_in
-
-        if found:
-            while r < cfg.start_radius * 2:
-                r += cfg.step_out
-                px, py = r * vx, r * vy
-                cand = affinity.translate(base, xoff=px, yoff=py)
-                if not collides_fast(cand, idx, existing, cfg.collision_buffer):
+            # Fine-tune outward
+            r = r_max
+            for _ in range(10):
+                x = r * math.cos(angle)
+                y = r * math.sin(angle)
+                poly = make_tree(x, y, deg)
+                if not collides(poly, polys, buf):
                     break
+                r += 0.01
+
+            if not collides(poly, polys, buf):
+                test_placements = placements + [(x, y, deg)]
+                test_polys = polys + [poly]
+                score = bbox_side_polys(test_polys)
+
+                if score < best_dist:
+                    best_dist = score
+                    best_pos = (x, y, deg, poly)
+
+        if best_pos:
+            placements.append((best_pos[0], best_pos[1], best_pos[2]))
+            polys.append(best_pos[3])
         else:
-            r, px, py = 0, 0.0, 0.0
+            # Fallback
+            angle = random.uniform(0, 2 * math.pi)
+            r = 0.5 + i * 0.3
+            x, y = r * math.cos(angle), r * math.sin(angle)
+            deg = random.randint(0, 359)
+            placements.append((x, y, deg))
+            polys.append(make_tree(x, y, deg))
 
-        if r < min_r:
-            min_r = r
-            best = (px, py)
-
-    return best[0] if best[0] is not None else 0.0, best[1] if best[1] is not None else 0.0
+    return placements
 
 
-def place_hexagonal(base: Polygon, existing: List[Polygon], cfg: UltimateConfig) -> Tuple[float, float]:
-    """Place using hexagonal grid pattern - optimal for circle packing."""
-    if not existing:
-        return 0.0, 0.0
+def hexagonal_placement(n: int, cfg: Config, seed: int) -> List[Tuple[float, float, float]]:
+    """Place trees in hexagonal grid pattern."""
+    random.seed(seed)
 
-    idx = STRtree(existing)
-    best = (None, None)
-    min_dist = float('inf')
+    if n == 0:
+        return []
+    if n == 1:
+        return [(0.0, 0.0, random.randint(0, 359))]
 
-    dx = 0.75
+    buf = cfg.collision_buffer
+    placements = []
+    polys = []
+
+    dx = 0.72
     dy = dx * math.sqrt(3) / 2
 
-    for ring in range(25):
+    # Generate grid positions sorted by distance from center
+    positions = []
+    for ring in range(20):
         for i in range(-ring, ring + 1):
             for j in range(-ring, ring + 1):
-                if abs(i) != ring and abs(j) != ring:
-                    continue
-
                 x = i * dx + (j % 2) * dx / 2
                 y = j * dy
+                dist = x*x + y*y
+                positions.append((dist, x, y))
 
-                cand = affinity.translate(base, xoff=x, yoff=y)
-                if not collides_fast(cand, idx, existing, cfg.collision_buffer):
-                    dist = x*x + y*y
-                    if dist < min_dist:
-                        min_dist = dist
-                        best = (x, y)
+    positions.sort()
 
-    return best[0] if best[0] is not None else 0.0, best[1] if best[1] is not None else 0.0
+    for dist, x, y in positions:
+        if len(placements) >= n:
+            break
 
+        deg = random.randint(0, 359)
+        poly = make_tree(x, y, deg)
 
-def place_boundary(base: Polygon, existing: List[Polygon], cfg: UltimateConfig) -> Tuple[float, float]:
-    """Place on boundary of existing polygon union."""
-    if not existing:
-        return 0.0, 0.0
+        if not collides(poly, polys, buf):
+            placements.append((x, y, deg))
+            polys.append(poly)
 
-    idx = STRtree(existing)
-    hull = unary_union(existing).convex_hull
-    boundary = hull.boundary
+    # Fill remaining with radial if needed
+    while len(placements) < n:
+        angle = random.uniform(0, 2 * math.pi)
+        r = 1.0 + len(placements) * 0.2
+        x, y = r * math.cos(angle), r * math.sin(angle)
+        deg = random.randint(0, 359)
+        poly = make_tree(x, y, deg)
 
-    best = (None, None)
-    min_dist = float('inf')
+        if not collides(poly, polys, buf):
+            placements.append((x, y, deg))
+            polys.append(poly)
 
-    length = boundary.length
-    for i in range(150):
-        t = i / 150.0
-        pt = boundary.interpolate(t * length)
-
-        for offset in np.arange(-0.4, 0.4, 0.08):
-            for angle in range(0, 360, 20):
-                rad = math.radians(angle)
-                x = pt.x + offset * math.cos(rad)
-                y = pt.y + offset * math.sin(rad)
-
-                cand = affinity.translate(base, xoff=x, yoff=y)
-                if not collides_fast(cand, idx, existing, cfg.collision_buffer):
-                    dist = x*x + y*y
-                    if dist < min_dist:
-                        min_dist = dist
-                        best = (x, y)
-
-    return best[0] if best[0] is not None else 0.0, best[1] if best[1] is not None else 0.0
+    return placements[:n]
 
 
-def place_nfp(base: Polygon, existing: List[Polygon], cfg: UltimateConfig) -> Optional[Tuple[float, float]]:
-    """Place using No-Fit Polygon."""
-    if not existing or not cfg.use_nfp or not HAS_PYCLIPPER:
-        return None
+def spiral_placement(n: int, cfg: Config, seed: int) -> List[Tuple[float, float, float]]:
+    """Place trees in spiral pattern."""
+    random.seed(seed)
 
-    combined_nfp = nfp_computer.compute_combined_nfp(existing, base)
-    if combined_nfp is not None:
-        pos = nfp_computer.find_valid_position(combined_nfp, center=(0, 0), num_samples=200)
-        if pos:
-            test_poly = affinity.translate(base, xoff=pos[0], yoff=pos[1])
-            if not collides(test_poly, existing, cfg.collision_buffer):
-                return pos
-    return None
+    if n == 0:
+        return []
+    if n == 1:
+        return [(0.0, 0.0, random.randint(0, 359))]
+
+    buf = cfg.collision_buffer
+    placements = []
+    polys = []
+
+    angle = 0
+    radius = 0.0
+    golden_angle = math.pi * (3 - math.sqrt(5))  # ~137.5 degrees
+
+    for i in range(n * 3):  # Try more positions than needed
+        if len(placements) >= n:
+            break
+
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        deg = random.randint(0, 359)
+        poly = make_tree(x, y, deg)
+
+        if not collides(poly, polys, buf):
+            placements.append((x, y, deg))
+            polys.append(poly)
+
+        angle += golden_angle
+        radius += 0.08
+
+    return placements[:n]
 
 
 # =============================================================================
-# SIMULATED ANNEALING - ULTIMATE
+# SIMULATED ANNEALING
 # =============================================================================
 
-def sa_ultimate(placements: List[Tuple[float, float, float]], cfg: UltimateConfig,
-                time_limit: float, seed: int = 42) -> List[Tuple[float, float, float]]:
-    """Ultimate Simulated Annealing with 6 move types."""
+def simulated_annealing(placements: List[Tuple[float, float, float]],
+                        cfg: Config, time_limit: float,
+                        seed: int) -> List[Tuple[float, float, float]]:
+    """Simulated annealing optimization."""
     n = len(placements)
     if n <= 1:
         return placements
 
     random.seed(seed)
-    np.random.seed(seed)
-
     buf = cfg.collision_buffer
     start = time.time()
 
@@ -514,10 +405,9 @@ def sa_ultimate(placements: List[Tuple[float, float, float]], cfg: UltimateConfi
     best = list(current)
 
     T = cfg.sa_temp_initial
+    shift = 0.1 * cur_score
     iters = 0
     accepted = 0
-
-    shift = 0.12 * cur_score
 
     while time.time() - start < time_limit:
         iters += 1
@@ -525,48 +415,48 @@ def sa_ultimate(placements: List[Tuple[float, float, float]], cfg: UltimateConfi
         i = random.randrange(n)
         x, y, d = current[i]
 
-        mt = random.random()
+        move = random.random()
 
-        if mt < 0.15:
-            # Very precise move
-            nx = x + random.gauss(0, shift * 0.08)
-            ny = y + random.gauss(0, shift * 0.08)
+        if move < 0.12:
+            # Ultra-fine
+            nx = x + random.gauss(0, shift * 0.03)
+            ny = y + random.gauss(0, shift * 0.03)
             nd = d
-        elif mt < 0.35:
-            # Small move
-            nx = x + random.gauss(0, shift * 0.25)
-            ny = y + random.gauss(0, shift * 0.25)
+        elif move < 0.28:
+            # Fine
+            nx = x + random.gauss(0, shift * 0.1)
+            ny = y + random.gauss(0, shift * 0.1)
             nd = d
-        elif mt < 0.50:
-            # Medium move
-            nx = x + random.gauss(0, shift * 0.6)
-            ny = y + random.gauss(0, shift * 0.6)
+        elif move < 0.45:
+            # Medium
+            nx = x + random.gauss(0, shift * 0.3)
+            ny = y + random.gauss(0, shift * 0.3)
             nd = d
-        elif mt < 0.60:
-            # Large escape
-            nx = x + random.uniform(-shift * 2.5, shift * 2.5)
-            ny = y + random.uniform(-shift * 2.5, shift * 2.5)
+        elif move < 0.55:
+            # Large
+            nx = x + random.uniform(-shift * 1.5, shift * 1.5)
+            ny = y + random.uniform(-shift * 1.5, shift * 1.5)
             nd = d
-        elif mt < 0.72:
+        elif move < 0.65:
             # Fine rotation
             nx, ny = x, y
-            nd = (d + random.choice([-1, 1, -2, 2, -3, 3, -5, 5])) % 360
-        elif mt < 0.82:
-            # Larger rotation
+            nd = (d + random.choice([-1, 1, -2, 2, -3, 3])) % 360
+        elif move < 0.75:
+            # Large rotation
             nx, ny = x, y
-            nd = (d + random.choice([-10, 10, -15, 15, -30, 30, -45, 45, -90, 90])) % 360
-        elif mt < 0.92:
+            nd = (d + random.choice([-10, 10, -15, 15, -30, 30, -45, 45])) % 360
+        elif move < 0.88:
             # Center seeking
             cx = sum(p[0] for p in current) / n
             cy = sum(p[1] for p in current) / n
             dx, dy = cx - x, cy - y
-            dist = math.sqrt(dx*dx + dy*dy) + 0.001
-            step = random.uniform(0.01, 0.08) * cur_score
+            dist = math.sqrt(dx*dx + dy*dy) + 1e-6
+            step = random.uniform(0.005, 0.05) * cur_score
             nx = x + step * dx / dist
             ny = y + step * dy / dist
             nd = d
         else:
-            # Swap with neighbor
+            # Swap
             if n >= 2:
                 j = random.randrange(n)
                 while j == i:
@@ -575,17 +465,17 @@ def sa_ultimate(placements: List[Tuple[float, float, float]], cfg: UltimateConfi
 
                 new_poly_i = make_tree(ox, oy, d)
                 new_poly_j = make_tree(x, y, od)
-                others_i = [p for k, p in enumerate(polys) if k != i and k != j]
+                others = [p for k, p in enumerate(polys) if k != i and k != j]
 
-                if not collides(new_poly_i, others_i + [new_poly_j], buf) and \
-                   not collides(new_poly_j, others_i + [new_poly_i], buf):
+                if not collides(new_poly_i, others + [new_poly_j], buf) and \
+                   not collides(new_poly_j, others + [new_poly_i], buf):
                     old_polys = list(polys)
                     polys[i] = new_poly_i
                     polys[j] = new_poly_j
                     new_score = bbox_side_polys(polys)
 
                     delta = new_score - cur_score
-                    if delta <= 0 or (T > 0 and random.random() < math.exp(-delta / T)):
+                    if delta <= 0 or random.random() < math.exp(-delta / max(T, 1e-10)):
                         current[i] = (ox, oy, d)
                         current[j] = (x, y, od)
                         cur_score = new_score
@@ -615,7 +505,7 @@ def sa_ultimate(placements: List[Tuple[float, float, float]], cfg: UltimateConfi
         new_score = bbox_side_polys(polys)
 
         delta = new_score - cur_score
-        if delta <= 0 or (T > 0 and random.random() < math.exp(-delta / T)):
+        if delta <= 0 or random.random() < math.exp(-delta / max(T, 1e-10)):
             current[i] = (nx, ny, nd)
             cur_score = new_score
             accepted += 1
@@ -628,24 +518,23 @@ def sa_ultimate(placements: List[Tuple[float, float, float]], cfg: UltimateConfi
         progress = (time.time() - start) / time_limit
         T = cfg.sa_temp_initial * ((cfg.sa_temp_final / cfg.sa_temp_initial) ** progress)
 
-        # Adaptive step sizes
         if iters % 2000 == 0:
             rate = accepted / iters
             if rate > 0.35:
-                shift = min(cur_score * 0.4, shift * 1.08)
-            elif rate < 0.12:
-                shift = max(0.001, shift * 0.92)
+                shift = min(cur_score * 0.25, shift * 1.08)
+            elif rate < 0.1:
+                shift = max(0.0003, shift * 0.92)
 
     return best
 
 
 # =============================================================================
-# LOCAL SEARCH - ULTRA FINE
+# LOCAL SEARCH
 # =============================================================================
 
-def local_search_ultra(placements: List[Tuple[float, float, float]],
-                       cfg: UltimateConfig) -> List[Tuple[float, float, float]]:
-    """Ultra fine-grained local search."""
+def local_search(placements: List[Tuple[float, float, float]],
+                 cfg: Config) -> List[Tuple[float, float, float]]:
+    """Fine-grained local search."""
     n = len(placements)
     if n <= 1:
         return placements
@@ -664,17 +553,14 @@ def local_search_ultra(placements: List[Tuple[float, float, float]],
         improved = False
         iters += 1
 
-        order = list(range(n))
-        random.shuffle(order)
-
-        for i in order:
+        for i in random.sample(range(n), n):
             x, y, d = current[i]
             best_move = None
             best_improvement = 0
 
             # Multi-scale moves
             moves = []
-            for scale in [0.25, 0.5, 1.0, 1.5, 2.0]:
+            for scale in [0.25, 0.5, 1.0, 1.5, 2.5]:
                 p = prec * scale
                 moves.extend([
                     (-p, 0), (p, 0), (0, -p), (0, p),
@@ -698,7 +584,7 @@ def local_search_ultra(placements: List[Tuple[float, float, float]],
 
                     polys[i] = old_poly
 
-            # Fine rotations
+            # Rotations
             for dd in [-1, 1, -2, 2, -3, 3, -5, 5]:
                 nd = (d + dd) % 360
                 new_poly = make_tree(x, y, nd)
@@ -716,7 +602,7 @@ def local_search_ultra(placements: List[Tuple[float, float, float]],
 
                     polys[i] = old_poly
 
-            if best_move is not None and best_improvement > 1e-8:
+            if best_move and best_improvement > 1e-9:
                 current[i] = (best_move[0], best_move[1], best_move[2])
                 polys[i] = best_move[3]
                 cur_score -= best_improvement
@@ -726,12 +612,12 @@ def local_search_ultra(placements: List[Tuple[float, float, float]],
 
 
 # =============================================================================
-# COMPACTING - AGGRESSIVE
+# COMPACTING
 # =============================================================================
 
-def compact_aggressive(placements: List[Tuple[float, float, float]],
-                       cfg: UltimateConfig) -> List[Tuple[float, float, float]]:
-    """Aggressive compacting toward center."""
+def compact_toward_center(placements: List[Tuple[float, float, float]],
+                          cfg: Config) -> List[Tuple[float, float, float]]:
+    """Compact trees toward center."""
     n = len(placements)
     if n <= 1:
         return placements
@@ -747,18 +633,19 @@ def compact_aggressive(placements: List[Tuple[float, float, float]],
         cx = sum(p[0] for p in current) / n
         cy = sum(p[1] for p in current) / n
 
+        # Sort by distance from center (furthest first)
         dists = [(i, math.sqrt((p[0]-cx)**2 + (p[1]-cy)**2)) for i, p in enumerate(current)]
         dists.sort(key=lambda x: -x[1])
 
         for idx, dist in dists:
-            if dist < 0.015:
+            if dist < 0.01:
                 continue
 
             x, y, d = current[idx]
             dx, dy = cx - x, cy - y
-            norm = math.sqrt(dx*dx + dy*dy) + 0.001
+            norm = math.sqrt(dx*dx + dy*dy) + 1e-6
 
-            for mult in [1.0, 0.5, 0.25, 0.1, 0.05, 0.02, 0.01, 0.005]:
+            for mult in [1.0, 0.5, 0.25, 0.12, 0.06, 0.03, 0.015]:
                 move = step * mult * dist * 15
                 nx = x + move * dx / norm
                 ny = y + move * dy / norm
@@ -775,117 +662,86 @@ def compact_aggressive(placements: List[Tuple[float, float, float]],
 
 
 # =============================================================================
-# BASIN HOPPING
+# SOLVE SINGLE PUZZLE (Independent)
 # =============================================================================
 
-def basin_hop(placements: List[Tuple[float, float, float]], cfg: UltimateConfig,
-              time_limit: float) -> List[Tuple[float, float, float]]:
-    """Basin hopping for escaping local minima."""
-    n = len(placements)
-    if n <= 1:
-        return placements
+def solve_puzzle(n: int, cfg: Config, time_limit: float,
+                 seed: int) -> Tuple[int, List[Tuple[float, float, float]], float]:
+    """
+    Solve a single puzzle INDEPENDENTLY (not incrementally).
+    This is the key fix - each puzzle is solved from scratch.
+    """
+    if n == 0:
+        return n, [], 0.0
+    if n == 1:
+        return n, [(0.0, 0.0, 0.0)], bbox_side([(0.0, 0.0, 0.0)])
 
-    start = time.time()
-    buf = cfg.collision_buffer
+    random.seed(seed)
+    np.random.seed(seed)
 
-    best = list(placements)
-    best_score = bbox_side(best)
+    # Determine restarts based on n
+    if n <= 10:
+        num_restarts = cfg.restarts_small
+    elif n <= 50:
+        num_restarts = cfg.restarts_medium
+    else:
+        num_restarts = cfg.restarts_large
 
-    current = list(placements)
-    cur_score = best_score
+    best_placements = None
+    best_score = float('inf')
 
-    time_per_hop = time_limit / cfg.basin_hops
+    start_time = time.time()
+    time_per_restart = time_limit / max(num_restarts, 1)
 
-    for hop in range(cfg.basin_hops):
-        if time.time() - start >= time_limit * 0.95:
+    for restart in range(num_restarts):
+        if time.time() - start_time >= time_limit * 0.95:
             break
 
-        perturbed = list(current)
-        num_perturb = max(1, int(n * cfg.basin_perturbation))
-        indices = random.sample(range(n), min(num_perturb, n))
+        restart_seed = seed + restart * 1000
 
-        for i in indices:
-            x, y, d = perturbed[i]
-            perturbed[i] = (
-                x + random.gauss(0, 0.08 * cur_score),
-                y + random.gauss(0, 0.08 * cur_score),
-                (d + random.uniform(-25, 25)) % 360
-            )
+        # Choose placement strategy
+        strategy = restart % 3
+        if strategy == 0:
+            placements = greedy_radial_placement(n, cfg, restart_seed)
+        elif strategy == 1:
+            placements = hexagonal_placement(n, cfg, restart_seed)
+        else:
+            placements = spiral_placement(n, cfg, restart_seed)
 
-        if check_overlaps(perturbed, buf):
+        # Validate initial placement
+        if len(placements) != n or check_overlaps(placements, cfg.collision_buffer):
             continue
 
-        remaining = min(time_per_hop * 0.6, time_limit - (time.time() - start))
-        if remaining > 0.5:
-            optimized = sa_ultimate(perturbed, cfg, remaining, seed=hop)
-            optimized = local_search_ultra(optimized, cfg)
-            optimized = compact_aggressive(optimized, cfg)
+        # Optimization pipeline
+        remaining = min(time_per_restart * 0.8, time_limit - (time.time() - start_time))
 
-            opt_score = bbox_side(optimized)
+        if remaining > 0.3:
+            # SA optimization
+            placements = simulated_annealing(placements, cfg, remaining * 0.5, restart_seed)
 
-            if not check_overlaps(optimized, buf) and opt_score < best_score:
-                best = optimized
-                best_score = opt_score
-                current = optimized
-                cur_score = opt_score
-            elif opt_score < cur_score * 1.03:
-                current = optimized
-                cur_score = opt_score
+            # Local search
+            placements = local_search(placements, cfg)
 
-    return best
+            # Compact
+            placements = compact_toward_center(placements, cfg)
 
+            # Final local search
+            placements = local_search(placements, cfg)
 
-# =============================================================================
-# PROGRESS BAR
-# =============================================================================
+        # Validate and score
+        if not check_overlaps(placements, cfg.collision_buffer):
+            score = bbox_side(placements)
+            if score < best_score:
+                best_score = score
+                best_placements = center_placements(placements)
 
-class ProgressBar:
-    """Simple progress bar for terminal output."""
+    if best_placements is None:
+        # Fallback
+        best_placements = greedy_radial_placement(n, cfg, seed)
+        best_placements = center_placements(best_placements)
+        best_score = bbox_side(best_placements)
 
-    def __init__(self, total: int, desc: str = "", width: int = 40):
-        self.total = total
-        self.desc = desc
-        self.width = width
-        self.current = 0
-        self.start_time = time.time()
-        self.last_update = 0
-
-    def update(self, n: int = 1, extra: str = ""):
-        self.current += n
-
-        now = time.time()
-        if now - self.last_update < 0.1 and self.current < self.total:
-            return
-        self.last_update = now
-
-        progress = self.current / self.total
-        filled = int(self.width * progress)
-        bar = "=" * filled + ">" + " " * (self.width - filled - 1)
-
-        elapsed = now - self.start_time
-        if progress > 0:
-            eta = elapsed / progress - elapsed
-            eta_str = f"ETA: {int(eta//60):02d}:{int(eta%60):02d}"
-        else:
-            eta_str = "ETA: --:--"
-
-        percent = progress * 100
-
-        line = f"\r{self.desc}: [{bar}] {percent:5.1f}% ({self.current}/{self.total}) {eta_str}"
-        if extra:
-            line += f" | {extra}"
-
-        sys.stdout.write(line + " " * 10)
-        sys.stdout.flush()
-
-        if self.current >= self.total:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-
-    def close(self):
-        if self.current < self.total:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+    return n, best_placements, best_score
 
 
 # =============================================================================
@@ -893,247 +749,143 @@ class ProgressBar:
 # =============================================================================
 
 class UltimateSolver:
-    """Ultimate solver with all optimization techniques."""
+    """Ultimate solver with parallel independent puzzle solving."""
 
-    def __init__(self, config: Optional[UltimateConfig] = None, verbose: bool = True):
-        self.cfg = config or UltimateConfig()
+    def __init__(self, config: Optional[Config] = None, verbose: bool = True):
+        self.cfg = config or Config()
         self.verbose = verbose
-
         self.solutions: Dict[int, List[Tuple[float, float, float]]] = {}
-        self.scores: Dict[int, float] = {}
+        self.running = True
 
-        self.start_time = None
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
 
-    def solve_single(self, n: int, prev: List[Tuple[float, float, float]]) -> Tuple[List[Tuple[float, float, float]], float]:
-        """Solve for n trees with ultimate optimization."""
-        if n <= 0:
-            return [], 0.0
+    def _signal_handler(self, signum, frame):
+        print("\n\nReceived stop signal. Saving progress...")
+        self.running = False
 
-        if n == 1:
-            sol = [(0.0, 0.0, 0.0)]
-            return sol, bbox_side(sol)
+    def compute_time_allocation(self, total_time: float) -> Dict[int, float]:
+        """Allocate more time to small n (higher score contribution)."""
+        allocations = {}
+        total_weight = 0
 
-        n_start = time.time()
-        time_budget = self.cfg.get_time_for_n(n)
-        num_restarts = self.cfg.get_restarts_for_n(n)
+        for n in range(1, 201):
+            # Weight inversely proportional to n (small n = more time)
+            weight = 10.0 / n
+            allocations[n] = weight
+            total_weight += weight
 
-        # Check total time limit
-        if self.start_time:
-            elapsed = time.time() - self.start_time
-            max_seconds = self.cfg.max_total_hours * 3600
-            remaining = max_seconds - elapsed
-            if remaining < 60:
-                time_budget = min(time_budget, 5.0)
-                num_restarts = min(num_restarts, 10)
+        # Normalize to total time (reserve 10% for overhead)
+        usable_time = total_time * 0.9
+        for n in range(1, 201):
+            allocations[n] = (allocations[n] / total_weight) * usable_time
+            allocations[n] = max(allocations[n], 3.0)  # Minimum 3 seconds
 
-        prev_polys = [make_tree(x, y, d) for x, y, d in prev]
+        return allocations
 
-        best_sol = None
-        best_score = float('inf')
-
-        angles = list(range(0, 360, 5))  # 72 angles
-
-        for restart in range(num_restarts):
-            if time.time() - n_start >= time_budget * 0.95:
-                break
-
-            seed = self.cfg.seed + restart * 1000 + n
-            random.seed(seed)
-
-            angle = angles[restart % len(angles)]
-            base = ROTATED_POLYGONS[angle]
-
-            # Placement strategy rotation
-            strat = restart % 5
-            if strat == 0:
-                pos = place_nfp(base, prev_polys, self.cfg)
-                if pos is None:
-                    bx, by = place_radial(base, prev_polys, self.cfg)
-                else:
-                    bx, by = pos
-            elif strat == 1:
-                bx, by = place_radial(base, prev_polys, self.cfg)
-            elif strat == 2:
-                bx, by = place_hexagonal(base, prev_polys, self.cfg)
-            elif strat == 3:
-                bx, by = place_boundary(base, prev_polys, self.cfg)
-            else:
-                # Best of all strategies
-                candidates = []
-                for fn in [place_radial, place_hexagonal, place_boundary]:
-                    px, py = fn(base, prev_polys, self.cfg)
-                    candidates.append((px*px + py*py, px, py))
-                nfp_pos = place_nfp(base, prev_polys, self.cfg)
-                if nfp_pos:
-                    candidates.append((nfp_pos[0]**2 + nfp_pos[1]**2, nfp_pos[0], nfp_pos[1]))
-                candidates.sort()
-                bx, by = candidates[0][1], candidates[0][2]
-
-            sol = prev + [(bx, by, float(angle))]
-
-            # Perturb from best on later restarts
-            if restart > 0 and best_sol is not None and restart % 2 != 0:
-                sol = list(best_sol)
-                num_p = max(1, int(n * 0.12))
-                for idx in random.sample(range(n), min(num_p, n)):
-                    x, y, d = sol[idx]
-                    sol[idx] = (
-                        x + random.gauss(0, 0.025 * best_score),
-                        y + random.gauss(0, 0.025 * best_score),
-                        (d + random.uniform(-12, 12)) % 360
-                    )
-
-            if check_overlaps(sol, self.cfg.collision_buffer):
-                continue
-
-            # Optimization pipeline
-            remaining = time_budget - (time.time() - n_start)
-            per_restart = remaining / max(1, num_restarts - restart)
-
-            if per_restart > 0.3:
-                sol = sa_ultimate(sol, self.cfg, per_restart * 0.5, seed)
-                sol = local_search_ultra(sol, self.cfg)
-                sol = compact_aggressive(sol, self.cfg)
-                sol = local_search_ultra(sol, self.cfg)
-
-            score = bbox_side(sol)
-            if not check_overlaps(sol, self.cfg.collision_buffer) and score < best_score:
-                best_score = score
-                best_sol = sol
-
-        # Final basin hopping
-        if best_sol is not None and time.time() - n_start < time_budget * 0.9:
-            remaining = time_budget - (time.time() - n_start)
-            if remaining > 2.0:
-                best_sol = basin_hop(best_sol, self.cfg, remaining * 0.4)
-                best_sol = compact_aggressive(best_sol, self.cfg)
-                best_sol = local_search_ultra(best_sol, self.cfg)
-                best_score = bbox_side(best_sol)
-
-        if best_sol is None:
-            angle = random.uniform(0, 360)
-            base = affinity.rotate(BASE_POLYGON, angle, origin=(0, 0))
-            bx, by = place_radial(base, prev_polys, self.cfg)
-            best_sol = prev + [(bx, by, angle)]
-            best_score = bbox_side(best_sol)
-
-        return center(best_sol), best_score
-
-    def solve_all(self, max_n: int = 200) -> Dict[int, List[Tuple[float, float, float]]]:
-        """Solve for all n from 1 to max_n."""
-        self.start_time = time.time()
+    def solve_all(self, output_path: str = "submission.csv") -> float:
+        """Solve all puzzles in parallel."""
+        total_time = self.cfg.total_time_hours * 3600
+        start_time = time.time()
 
         if self.verbose:
             print("=" * 70)
-            print("SANTA 2025 - ULTIMATE SOLVER")
+            print("SANTA 2025 - ULTIMATE SOLVER (Fixed - Independent & Parallel)")
             print("=" * 70)
-            print(f"Base time per puzzle: {self.cfg.base_time_per_puzzle:.0f}s")
-            print(f"Priority multiplier: {self.cfg.priority_multiplier:.1f}x")
-            print(f"Base restarts: {self.cfg.base_restarts}")
-            print(f"Priority restarts: {self.cfg.priority_restarts}")
-            print(f"NFP enabled: {self.cfg.use_nfp and HAS_PYCLIPPER}")
-            print(f"Max hours: {self.cfg.max_total_hours:.1f}")
+            print(f"Cores: {self.cfg.num_cores}")
+            print(f"Total time budget: {self.cfg.total_time_hours:.1f} hours")
+            print(f"Restarts: small={self.cfg.restarts_small}, med={self.cfg.restarts_medium}, large={self.cfg.restarts_large}")
+            print(f"Collision buffer: {self.cfg.collision_buffer}")
+            print("=" * 70)
             print()
 
-            est_time = sum(self.cfg.get_time_for_n(n) for n in range(1, max_n + 1))
-            print(f"Estimated time: {est_time / 3600:.1f} hours")
-            print()
+        # Compute time per puzzle
+        time_alloc = self.compute_time_allocation(total_time)
 
-        # Use tqdm if available, otherwise our custom progress bar
+        # Prepare work items
+        work_items = []
+        for n in range(1, 201):
+            work_items.append((n, self.cfg, time_alloc[n], self.cfg.seed + n))
+
+        # Progress tracking
+        completed = 0
         if HAS_TQDM:
-            pbar = tqdm(range(1, max_n + 1), desc="Solving", unit="puzzle",
-                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]')
+            pbar = tqdm(total=200, desc="Solving",
+                       bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]')
         else:
-            pbar = ProgressBar(max_n, desc="Solving")
+            print("Solving puzzles...")
 
-        for n in range(1, max_n + 1):
-            n_start = time.time()
+        # Parallel execution
+        with ProcessPoolExecutor(max_workers=self.cfg.num_cores) as executor:
+            futures = {executor.submit(solve_puzzle, *item): item[0] for item in work_items}
 
-            prev = self.solutions[n - 1] if n > 1 else []
-            sol, score = self.solve_single(n, prev)
+            for future in as_completed(futures):
+                if not self.running:
+                    break
 
-            self.solutions[n] = sol
-            self.scores[n] = score
+                try:
+                    n, placements, score = future.result()
+                    self.solutions[n] = placements
+                    completed += 1
 
-            elapsed_n = time.time() - n_start
-            total_score = self.total_score()
-
-            if HAS_TQDM:
-                pbar.set_postfix({'score': f'{total_score:.2f}', 'side': f'{score:.4f}'})
-                pbar.update(1)
-            else:
-                pbar.update(1, extra=f"n={n}, side={score:.4f}, total={total_score:.2f}")
-
-            # Checkpoint
-            if n % self.cfg.checkpoint_interval == 0:
-                self.save_checkpoint()
+                    if self.verbose:
+                        total_score = self.compute_score()
+                        if HAS_TQDM:
+                            pbar.update(1)
+                            pbar.set_postfix({'n': n, 'side': f'{score:.3f}', 'total': f'{total_score:.2f}'})
+                        elif completed % 20 == 0:
+                            print(f"  Progress: {completed}/200, Score: {total_score:.2f}")
+                except Exception as e:
+                    print(f"Error solving n={futures[future]}: {e}")
 
         if HAS_TQDM:
             pbar.close()
 
+        # Save results
+        self.save_submission(output_path)
+
+        total_time_taken = time.time() - start_time
+        final_score = self.compute_score()
+
         if self.verbose:
-            total_time = time.time() - self.start_time
-            total = self.total_score()
             print()
             print("=" * 70)
-            print(f"COMPLETE - Time: {total_time/3600:.2f} hours")
-            print(f"Final Score: {total:.4f}")
+            print("COMPLETE")
+            print(f"  Puzzles solved: {len(self.solutions)}")
+            print(f"  Final score: {final_score:.4f}")
+            print(f"  Time taken: {total_time_taken/3600:.2f} hours")
+            print(f"  Baseline: 157.08")
+            print(f"  Improvement: {(157.08 - final_score) / 157.08 * 100:.1f}%")
+            print(f"  Output: {output_path}")
             print("=" * 70)
 
-        return self.solutions
+        return final_score
 
-    def total_score(self) -> float:
-        """Compute competition score."""
+    def compute_score(self) -> float:
+        """Compute total competition score."""
         total = 0.0
         for n, sol in self.solutions.items():
-            side = self.scores.get(n, bbox_side(sol))
-            total += (side ** 2) / n
+            if sol:
+                side = bbox_side(sol)
+                total += (side ** 2) / n
         return total
 
-    def save_checkpoint(self):
-        """Save checkpoint."""
-        try:
-            create_submission(self.solutions, self.cfg.checkpoint_path)
-        except Exception:
-            pass
-
-
-# =============================================================================
-# I/O
-# =============================================================================
-
-def create_submission(solutions: Dict[int, List[Tuple[float, float, float]]],
-                      output: str = "submission.csv") -> str:
-    """Create submission CSV."""
-    with open(output, "w") as f:
-        f.write("id,x,y,deg\n")
-        for n in sorted(solutions.keys()):
-            pos = solutions[n]
-            if not pos:
-                continue
-            polys = [make_tree(x, y, d) for x, y, d in pos]
-            b = unary_union(polys).bounds
-            for idx, (x, y, d) in enumerate(pos):
-                f.write(f"{n:03d}_{idx},s{x - b[0]:.6f},s{y - b[1]:.6f},s{d:.6f}\n")
-    return output
-
-
-def validate_all(solutions: Dict[int, List[Tuple[float, float, float]]]) -> bool:
-    """Validate all solutions."""
-    valid = True
-    for n in range(1, 201):
-        if n not in solutions or len(solutions[n]) != n:
-            print(f"  n={n}: Invalid count")
-            valid = False
-            continue
-        if check_overlaps(solutions[n]):
-            print(f"  n={n}: Has overlaps")
-            valid = False
-    return valid
+    def save_submission(self, output_path: str):
+        """Save solutions to CSV."""
+        with open(output_path, "w") as f:
+            f.write("id,x,y,deg\n")
+            for n in sorted(self.solutions.keys()):
+                pos = self.solutions[n]
+                if not pos:
+                    continue
+                polys = [make_tree(x, y, d) for x, y, d in pos]
+                b = unary_union(polys).bounds
+                for idx, (x, y, d) in enumerate(pos):
+                    f.write(f"{n:03d}_{idx},s{x - b[0]:.6f},s{y - b[1]:.6f},s{d:.6f}\n")
 
 
 def print_summary(solutions: Dict[int, List[Tuple[float, float, float]]]):
-    """Print detailed score summary."""
+    """Print score summary."""
     print("=" * 60)
     print("SCORE SUMMARY")
     print("=" * 60)
@@ -1146,14 +898,13 @@ def print_summary(solutions: Dict[int, List[Tuple[float, float, float]]]):
     print(f"Baseline: 157.08")
     print(f"Improvement: {(157.08 - total) / 157.08 * 100:.1f}%")
 
-    worst = sorted(contribs.items(), key=lambda x: -x[1])[:15]
-    print("\nTop 15 worst contributions (focus here):")
+    worst = sorted(contribs.items(), key=lambda x: -x[1])[:10]
+    print("\nTop 10 worst contributors:")
     for n, c in worst:
         print(f"  n={n:3d}: side={sides[n]:.4f}, contrib={c:.4f}")
 
-    print("\nScore by n ranges:")
-    ranges = [(1, 10), (11, 50), (51, 100), (101, 150), (151, 200)]
-    for start, end in ranges:
+    print("\nScore by range:")
+    for start, end in [(1, 10), (11, 50), (51, 100), (101, 150), (151, 200)]:
         range_score = sum(contribs.get(n, 0) for n in range(start, end + 1))
         print(f"  n={start:3d}-{end:3d}: {range_score:.4f}")
 
@@ -1166,25 +917,25 @@ def print_summary(solutions: Dict[int, List[Tuple[float, float, float]]]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Santa 2025 Ultimate Solver",
+        description="Santa 2025 Ultimate Solver (Fixed - Independent & Parallel)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python ultimate_solver.py --output submission.csv
-  python ultimate_solver.py --quick --output test.csv
-  python ultimate_solver.py --standard --output submission.csv
-  python ultimate_solver.py --ultra --output best.csv
+  python ultimate_solver.py --output submission.csv --cores 15
+  python ultimate_solver.py --quick --cores 15
+  python ultimate_solver.py --standard --cores 15
+  python ultimate_solver.py --ultra --cores 15
 """
     )
     parser.add_argument("--output", default="submission.csv", help="Output CSV path")
-    parser.add_argument("--max-n", type=int, default=200, help="Maximum n to solve")
+    parser.add_argument("--cores", type=int, default=15, help="Number of CPU cores")
     parser.add_argument("--quick", action="store_true", help="Quick mode (~1-2 hours)")
     parser.add_argument("--standard", action="store_true", help="Standard mode (~6-12 hours)")
     parser.add_argument("--ultra", action="store_true", help="Ultra mode (~24-48 hours)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
-    # Select configuration
+    # Select config
     if args.quick:
         cfg = quick_config()
         print("Using QUICK mode (~1-2 hours)")
@@ -1195,32 +946,21 @@ Examples:
         cfg = standard_config()
         print("Using STANDARD mode (~6-12 hours)")
 
+    cfg.num_cores = args.cores
     cfg.seed = args.seed
 
     print()
-    if not HAS_PYCLIPPER:
-        print("Warning: pyclipper not installed. Install with: pip install pyclipper")
     if not HAS_TQDM:
-        print("Note: Install tqdm for better progress bars: pip install tqdm")
-    print()
+        print("Note: Install tqdm for progress bars: pip install tqdm")
+        print()
 
     # Solve
     solver = UltimateSolver(config=cfg, verbose=True)
-    solutions = solver.solve_all(max_n=args.max_n)
-
-    # Validate
-    print("\nValidating...")
-    if validate_all(solutions):
-        print("All solutions valid!")
+    solver.solve_all(output_path=args.output)
 
     # Summary
     print()
-    print_summary(solutions)
-
-    # Save
-    print(f"\nSaving: {args.output}")
-    create_submission(solutions, args.output)
-    print(f"Final Score: {solver.total_score():.4f}")
+    print_summary(solver.solutions)
 
 
 if __name__ == "__main__":
