@@ -94,6 +94,58 @@ class OptimizedConfig:
     basin_perturbation: float = 0.12
 
 
+def ultra_config() -> OptimizedConfig:
+    """ULTRA MAXIMUM configuration for absolute best score (48-72 hour runs)."""
+    return OptimizedConfig(
+        num_cores=15,
+        seed=42,
+        collision_buffer=0.003,          # Tightest safe packing
+        repulsion_strength=0.10,
+        gravity_strength=0.12,
+        damping=0.80,
+        wave_passes=30,                   # Maximum compression passes
+        wave_step=0.0006,                 # Ultra-fine wave steps
+        radius_compression_prob=0.30,
+        radius_compression_strength=0.12,
+        force_iterations=500,             # Full physics relaxation
+        force_step=0.010,
+        sa_temp_initial=6.0,              # Higher initial temp for exploration
+        sa_temp_final=1e-14,              # Near-zero final temp
+        sa_iterations=150000,             # Massive SA iterations
+        num_restarts=250,                 # Maximum restarts
+        local_iterations=8000,            # Ultra-fine local search
+        local_precision=0.00008,          # Microscopic precision
+        basin_hops=40,                    # Many escape attempts
+        basin_perturbation=0.18,          # Larger perturbations
+    )
+
+
+def extreme_config() -> OptimizedConfig:
+    """EXTREME configuration for multi-day runs (72-168 hours / 3-7 days)."""
+    return OptimizedConfig(
+        num_cores=15,
+        seed=42,
+        collision_buffer=0.002,           # Extremely tight (risky)
+        repulsion_strength=0.08,
+        gravity_strength=0.14,
+        damping=0.78,
+        wave_passes=50,                   # Extreme compression
+        wave_step=0.0003,                 # Microscopic wave steps
+        radius_compression_prob=0.35,
+        radius_compression_strength=0.15,
+        force_iterations=800,             # Maximum physics
+        force_step=0.008,
+        sa_temp_initial=8.0,              # Very high exploration
+        sa_temp_final=1e-16,              # Practically zero
+        sa_iterations=300000,             # Extreme SA
+        num_restarts=500,                 # Maximum restarts
+        local_iterations=15000,           # Maximum local search
+        local_precision=0.00004,          # Nanoscopic precision
+        basin_hops=60,                    # Maximum escape attempts
+        basin_perturbation=0.22,          # Large perturbations
+    )
+
+
 # =============================================================================
 # GEOMETRY
 # =============================================================================
@@ -1092,21 +1144,43 @@ Examples:
   # Quick test (1 hour)
   python optimized_solver.py --output test.csv --time-hours 1
 
-  # Long run (24 hours)
-  python optimized_solver.py --output best.csv --time-hours 24
+  # ULTRA mode - BEST SCORE (48-72 hours recommended)
+  python optimized_solver.py --ultra --output ultra.csv --time-hours 48
+
+  # EXTREME mode - ABSOLUTE BEST (72-168 hours / 3-7 days)
+  python optimized_solver.py --extreme --output extreme.csv --time-hours 72
 """
     )
     parser.add_argument("--output", default="submission.csv", help="Output CSV path")
     parser.add_argument("--time-hours", type=float, default=4.0, help="Total runtime in hours (default: 4)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--restarts", type=int, default=80, help="Restarts per puzzle")
+    parser.add_argument("--restarts", type=int, default=None, help="Restarts per puzzle (overrides mode default)")
+    parser.add_argument("--ultra", action="store_true", help="ULTRA mode: Best score (48-72 hour runs)")
+    parser.add_argument("--extreme", action="store_true", help="EXTREME mode: Absolute best (72-168 hour runs)")
     args = parser.parse_args()
 
-    # Configure - ALWAYS 15 CORES
-    cfg = OptimizedConfig()
-    cfg.num_cores = 15  # Hardcoded 15 cores
+    # Select configuration based on mode
+    if args.extreme:
+        cfg = extreme_config()
+        print("=" * 70)
+        print("EXTREME MODE - ABSOLUTE MAXIMUM OPTIMIZATION")
+        print("Recommended runtime: 72-168 hours (3-7 days)")
+        print("=" * 70)
+    elif args.ultra:
+        cfg = ultra_config()
+        print("=" * 70)
+        print("ULTRA MODE - MAXIMUM OPTIMIZATION")
+        print("Recommended runtime: 48-72 hours")
+        print("=" * 70)
+    else:
+        cfg = OptimizedConfig()
+        print("STANDARD MODE - Balanced optimization")
+
+    # Override seed and restarts if specified
+    cfg.num_cores = 15  # ALWAYS 15 cores
     cfg.seed = args.seed
-    cfg.num_restarts = args.restarts
+    if args.restarts is not None:
+        cfg.num_restarts = args.restarts
 
     # Solve
     solver = OptimizedSolver(config=cfg, verbose=True)
